@@ -41,15 +41,30 @@ def evaluate_model(name: str, model, X_test, y_test, labels=PRIORITY_LABELS):
 
 
 def save_feature_importance(name: str, model):
-    if not hasattr(model, "feature_importances_"):
+    """
+    Tree-based models expose feature_importances_ (Gini/entropy-based).
+    Logistic Regression exposes coef_ (one row per class). We take the
+    mean absolute coefficient across all classes as a proxy for overall
+    feature influence — larger absolute coefficient = stronger signal.
+    """
+    if hasattr(model, "feature_importances_"):
+        importances = model.feature_importances_
+        xlabel = "Importance (Gini)"
+
+    elif hasattr(model, "coef_"):
+        # coef_ shape: (n_classes, n_features) for multiclass, (1, n_features) for binary
+        importances = np.mean(np.abs(model.coef_), axis=0)
+        xlabel = "Mean |Coefficient| across classes"
+
+    else:
         return None
-    importances = model.feature_importances_
+
     order = np.argsort(importances)[::-1]
 
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.barh([FEATURE_COLS[i] for i in order][::-1], importances[order][::-1])
     ax.set_title(f"Feature Importance — {name}")
-    ax.set_xlabel("Importance")
+    ax.set_xlabel(xlabel)
     plt.tight_layout()
     fig.savefig(REPORTS_DIR / f"feature_importance_{name}.png", dpi=150)
     plt.close(fig)
