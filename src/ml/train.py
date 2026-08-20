@@ -18,8 +18,15 @@ from sklearn.ensemble import RandomForestClassifier
 from src.config import MODELS_DIR, RANDOM_SEED, PRIORITY_LABELS
 
 FEATURE_COLS = [
-    "severity_raw", "report_count_norm", "recency_score",
-    "source_reliability", "exploited_flag", "is_cve", "is_malicious_ip",
+    "severity_raw",
+    "report_count_norm",
+    "recency_score",
+    "source_reliability",
+    "exploited_flag",
+    "reference_count_norm",   # NVD: advisory breadth signal
+    "high_risk_country",      # AbuseIPDB: geographic risk signal
+    "is_cve",
+    "is_malicious_ip",
 ]
 
 
@@ -36,7 +43,7 @@ def prepare_train_test(labeled_df: pd.DataFrame, test_size: float = 0.25):
     if not can_stratify:
         print(f"[train] WARNING: stratified split not possible, class counts: "
               f"{class_counts.to_dict()}. Falling back to a random (non-stratified) split. "
-              f"This is a class-imbalance risk worth flagging in Review 2.")
+              f"This is a class-imbalance risk worth flagging .")
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=RANDOM_SEED,

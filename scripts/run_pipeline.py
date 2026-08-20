@@ -40,29 +40,39 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--synthetic", action="store_true", help="Use offline synthetic data")
     mode.add_argument("--live", action="store_true", help="Use real live APIs (needs keys + internet)")
+    mode.add_argument("--retrain", action="store_true",
+                      help="Skip collection; re-label and retrain on existing DB records")
     parser.add_argument("--n-cves", type=int, default=300)
     parser.add_argument("--n-ips", type=int, default=300)
     args = parser.parse_args()
 
     # 1. Collect
-    if args.synthetic:
+    if args.retrain:
+        total_in_db = db.count()
+        if total_in_db == 0:
+            print("[collect] ERROR: --retrain requires existing records in the DB. Run --live first.")
+            sys.exit(1)
+        print(f"[collect] --retrain: skipping collection, using {total_in_db} existing DB records")
+    elif args.synthetic:
         raw_nvd, raw_abuseipdb = collect_synthetic(args.n_cves, args.n_ips)
     else:
         raw_nvd, raw_abuseipdb = collect_live()
-    print(f"[collect] raw records: {len(raw_nvd)} NVD, {len(raw_abuseipdb)} AbuseIPDB")
 
-    # 2. Normalize
-    normalized = normalize_batch(raw_nvd, raw_abuseipdb)
-    print(f"[normalize] {len(normalized)} records mapped to common schema")
+    if not args.retrain:
+        print(f"[collect] raw records: {len(raw_nvd)} NVD, {len(raw_abuseipdb)} AbuseIPDB")
 
-    # 3. Deduplicate
-    deduped = deduplicate(normalized)
-    print(f"[dedup] {len(normalized)} -> {len(deduped)} after deduplication")
+        # 2. Normalize
+        normalized = normalize_batch(raw_nvd, raw_abuseipdb)
+        print(f"[normalize] {len(normalized)} records mapped to common schema")
 
-    # 4. Store
-    db.upsert_threats(deduped)
-    total_in_db = db.count()
-    print(f"[db] stored. total rows in database now: {total_in_db}")
+        # 3. Deduplicate
+        deduped = deduplicate(normalized)
+        print(f"[dedup] {len(normalized)} -> {len(deduped)} after deduplication")
+
+        # 4. Store
+        db.upsert_threats(deduped)
+        total_in_db = db.count()
+        print(f"[db] stored. total rows in database now: {total_in_db}")
 
     # 5. Feature engineering
     rows = db.fetch_all_as_dicts()
