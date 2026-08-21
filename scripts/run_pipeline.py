@@ -109,7 +109,9 @@ def main():
     severity_rank = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
     class_order = list(best_model.classes_)
     weights = [severity_rank[c] for c in class_order]
-    expected_severity = (pred_probs * weights).sum(axis=1) / max(weights)  # normalize to 0-1
+    # Always divide by 3 (Critical's rank) regardless of which classes are
+    # present in this run — avoids scores of 1.0 when Critical is absent.
+    expected_severity = (pred_probs * weights).sum(axis=1) / 3.0  # normalize to 0-1
 
     id_to_prediction = dict(zip(labeled["id"], zip(pred_labels, expected_severity)))
     db.update_predictions(id_to_prediction)
