@@ -353,11 +353,21 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 #  Tab layout
 # ─────────────────────────────────────────────
-tab_threats, tab_clusters, tab_mitre, tab_monitor, tab_models = st.tabs([
+from src.pipeline.db import (
+    fetch_alerts as _fetch_alerts,
+    fetch_unacknowledged_alert_count as _unack_count,
+    update_alert_status as _update_alert_status,
+)
+
+_unack = _unack_count()
+_alerts_label = f"🚨 Alerts ({_unack})" if _unack > 0 else "🚨 Alerts"
+
+tab_threats, tab_clusters, tab_mitre, tab_monitor, tab_alerts, tab_models = st.tabs([
     "🔒 Threats",
     "🔗 Clusters",
     "🧩 MITRE ATT&CK",
     "📡 Monitoring",
+    _alerts_label,
     "🤖 Model Evaluation",
 ])
 
@@ -1617,7 +1627,235 @@ or <code>--synthetic</code> / <code>--live</code>.
 
 
 # ══════════════════════════════════════════════
-#  TAB 5 — MODEL EVALUATION  (original content)
+#  TAB 5 — ALERTS  (Phase 5)
+# ══════════════════════════════════════════════
+with tab_alerts:
+
+    # Reload alert counts live (session_state changes on button clicks)
+    all_alerts = _fetch_alerts(limit=500)
+    alerts_df  = pd.DataFrame(all_alerts) if all_alerts else pd.DataFrame()
+
+    st.markdown("### 🚨 Analyst Alerts")
+    st.markdown("""
+<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:10px;
+            padding:14px 18px;margin-bottom:16px;font-size:0.88rem;color:#c4b5fd;'>
+<b style='color:#a855f7'>How alerts work</b><br>
+Alerts are generated automatically after each pipeline run. They surface events
+that warrant analyst attention without requiring manual review of every threat.
+<ul style='margin:6px 0 0 0;padding-left:18px;'>
+  <li><b style='color:#fda4af'>new_critical</b> — a brand-new Critical threat appeared</li>
+  <li><b style='color:#fdba74'>new_high</b> — a brand-new High threat appeared</li>
+  <li><b style='color:#fda4af'>priority_escalated</b> — an existing threat escalated to Critical or High</li>
+  <li><b style='color:#fdba74'>exploit_appeared</b> — exploitation evidence newly flagged on a known threat</li>
+  <li><b style='color:#fde68a'>notable_cluster</b> — a cluster crossed a notable severity/exploitation threshold</li>
+  <li><b style='color:#fde68a'>spike</b> — new threat count exceeded 2× the rolling run average</li>
+</ul>
+<br>
+Alerts are <b>dashboard-only</b> — no external emails or webhooks are sent.
+</div>
+""", unsafe_allow_html=True)
+
+    if alerts_df.empty:
+        st.info(
+            "No alerts yet. Run the pipeline to generate alerts:\n\n"
+            "```\npython scripts/run_pipeline.py --retrain\n```"
+        )
+    else:
+        # ── Summary metrics ────────────────────────────────────────────────
+        n_new   = int((alerts_df["status"] == "new").sum())
+        n_ack   = int((alerts_df["status"] == "acknowledged").sum())
+        n_dis   = int((alerts_df["status"] == "dismissed").sum())
+        n_crit_al = int((alerts_df["severity"] == "critical").sum())
+        n_high_al = int((alerts_df["severity"] == "high").sum())
+        n_warn_al = int((alerts_df["severity"] == "warning").sum())
+
+        am1, am2, am3, am4, am5, am6 = st.columns(6)
+        am1.metric("🔴 Unacknowledged", n_new)
+        am2.metric("✅ Acknowledged",   n_ack)
+        am3.metric("🚫 Dismissed",      n_dis)
+        am4.metric("Critical",          n_crit_al)
+        am5.metric("High",              n_high_al)
+        am6.metric("Warning",           n_warn_al)
+
+        st.divider()
+
+        # ── Filter controls ────────────────────────────────────────────────
+        af1, af2, af3 = st.columns([2, 2, 2])
+        sev_filter = af1.multiselect(
+            "Severity",
+            options=["critical", "high", "warning", "info"],
+            default=["critical", "high", "warning", "info"],
+            key="alert_sev_filter",
+        )
+        status_filter = af2.multiselect(
+            "Status",
+            options=["new", "acknowledged", "dismissed"],
+            default=["new", "acknowledged"],
+            key="alert_status_filter",
+        )
+        type_opts = sorted(alerts_df["alert_type"].unique().tolist())
+        type_filter_al = af3.multiselect(
+            "Alert type",
+            options=type_opts,
+            default=type_opts,
+            key="alert_type_filter",
+        )
+
+        # ── Bulk actions ───────────────────────────────────────────────────
+        ba1, ba2, _ = st.columns([2, 2, 4])
+        if ba1.button("✅ Acknowledge all new", key="ack_all_btn"):
+            new_ids = alerts_df[alerts_df["status"] == "new"]["alert_id"].tolist()
+            for aid in new_ids:
+                _update_alert_status(int(aid), "acknowledged")
+            st.rerun()
+        if ba2.button("🚫 Dismiss all acknowledged", key="dis_all_btn"):
+            ack_ids = alerts_df[alerts_df["status"] == "acknowledged"]["alert_id"].tolist()
+            for aid in ack_ids:
+                _update_alert_status(int(aid), "dismissed")
+            st.rerun()
+
+        st.divider()
+
+        # ── Apply filters ──────────────────────────────────────────────────
+        vis = alerts_df[
+            alerts_df["severity"].isin(sev_filter) &
+            alerts_df["status"].isin(status_filter) &
+            alerts_df["alert_type"].isin(type_filter_al)
+        ].copy()
+
+        if vis.empty:
+            st.info("No alerts match the current filters.")
+        else:
+            st.markdown(
+                f"<div style='color:#9f7aea;font-size:0.85rem;margin-bottom:10px;'>"
+                f"Showing {len(vis)} alert(s)</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Colour palettes per severity
+            SEV_STYLE = {
+                "critical": {
+                    "bg":     "#2d0a0a",
+                    "border": "#9f1239",
+                    "text":   "#fda4af",
+                    "badge_bg": "#4c0519",
+                    "icon":   "🔴",
+                },
+                "high": {
+                    "bg":     "#2d1407",
+                    "border": "#9a3412",
+                    "text":   "#fdba74",
+                    "badge_bg": "#431407",
+                    "icon":   "🟠",
+                },
+                "warning": {
+                    "bg":     "#2d2509",
+                    "border": "#92400e",
+                    "text":   "#fde68a",
+                    "badge_bg": "#3b2509",
+                    "icon":   "🟡",
+                },
+                "info": {
+                    "bg":     "#0d1a2d",
+                    "border": "#1d4ed8",
+                    "text":   "#93c5fd",
+                    "badge_bg": "#0c1a4a",
+                    "icon":   "🔵",
+                },
+            }
+
+            STATUS_LABEL = {
+                "new":          ("🔔 NEW",          "#9f1239", "#fda4af"),
+                "acknowledged": ("✅ ACKNOWLEDGED", "#166534", "#86efac"),
+                "dismissed":    ("🚫 DISMISSED",    "#374151", "#9ca3af"),
+            }
+
+            TYPE_LABEL = {
+                "new_critical":       "New Critical",
+                "new_high":           "New High",
+                "priority_escalated": "Escalated",
+                "exploit_appeared":   "Exploit Appeared",
+                "notable_cluster":    "Notable Cluster",
+                "spike":              "Spike",
+            }
+
+            for _, alert in vis.iterrows():
+                sev      = alert.get("severity", "info")
+                status   = alert.get("status",   "new")
+                atype    = alert.get("alert_type", "")
+                msg      = alert.get("message",    "")
+                alert_id = int(alert.get("alert_id", 0))
+                tid      = alert.get("threat_id") or ""
+                run_id_a = alert.get("run_id", "")
+                created  = str(alert.get("created_at", ""))[:19].replace("T", " ")
+
+                sty = SEV_STYLE.get(sev, SEV_STYLE["info"])
+                slabel, sbg, sfg = STATUS_LABEL.get(
+                    status, ("UNKNOWN", "#374151", "#9ca3af")
+                )
+                type_display = TYPE_LABEL.get(atype, atype.replace("_", " ").title())
+
+                # Dimmed styling for dismissed alerts
+                opacity = "0.45" if status == "dismissed" else "1"
+                new_border_extra = (
+                    f"box-shadow:0 0 0 2px {sty['border']}55;" if status == "new" else ""
+                )
+
+                st.markdown(
+                    f"""
+<div style='background:{sty["bg"]};border:1px solid {sty["border"]};
+            border-left:4px solid {sty["border"]};border-radius:10px;
+            padding:14px 18px;margin-bottom:8px;opacity:{opacity};
+            {new_border_extra}'>
+  <div style='display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;'>
+    <span style='font-size:1.3rem;'>{sty["icon"]}</span>
+    <div style='flex:1;min-width:250px;'>
+      <div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;'>
+        <span style='background:{sty["badge_bg"]};color:{sty["text"]};
+                     border:1px solid {sty["border"]};border-radius:12px;
+                     padding:2px 10px;font-size:0.72rem;font-weight:700;
+                     letter-spacing:0.5px;'>{sev.upper()}</span>
+        <span style='background:#1a0a3d;color:#a78bfa;border:1px solid #4a1d96;
+                     border-radius:12px;padding:2px 10px;font-size:0.72rem;
+                     font-weight:600;'>{type_display}</span>
+        <span style='background:{sbg};color:{sfg};border-radius:10px;
+                     padding:2px 8px;font-size:0.7rem;font-weight:700;'>{slabel}</span>
+      </div>
+      <div style='color:#e9d5ff;font-size:0.9rem;line-height:1.5;'>{msg}</div>
+      <div style='color:#7c5cbf;font-size:0.78rem;margin-top:6px;'>
+        {"Threat: <code style='color:#a78bfa;'>" + tid[:60] + "</code> &nbsp;·&nbsp; " if tid else ""}
+        Run #{run_id_a} &nbsp;·&nbsp; {created}
+      </div>
+    </div>
+  </div>
+</div>""",
+                    unsafe_allow_html=True,
+                )
+
+                # Action buttons — only show for non-dismissed
+                if status != "dismissed":
+                    btn_col1, btn_col2, _ = st.columns([1.4, 1.4, 7])
+                    if status == "new":
+                        if btn_col1.button(
+                            "✅ Acknowledge", key=f"ack_{alert_id}",
+                        ):
+                            _update_alert_status(alert_id, "acknowledged")
+                            st.rerun()
+                    if btn_col2.button(
+                        "🚫 Dismiss", key=f"dis_{alert_id}",
+                    ):
+                        _update_alert_status(alert_id, "dismissed")
+                        st.rerun()
+
+        st.divider()
+        st.caption(
+            "Alerts are generated automatically by the pipeline and stored in the local SQLite database. "
+            "No external notifications are sent. Re-run the pipeline to refresh alert data."
+        )
+
+
+# ══════════════════════════════════════════════
+#  TAB 6 — MODEL EVALUATION  (original content)
 # ══════════════════════════════════════════════
 with tab_models:
     metrics_path = REPORTS_DIR / "metrics.json"

@@ -23,6 +23,7 @@ from src.pipeline.labeling import apply_heuristic_labels
 from src.pipeline.clustering import cluster_threats
 from src.pipeline.summarizer import generate_all_summaries
 from src.pipeline.mitre_mapper import map_all_threats
+from src.pipeline.alerting import generate_alerts
 from src.ml.train import train_all_models
 from src.ml.evaluate import evaluate_all
 
@@ -212,6 +213,26 @@ def main():
         f"[monitor] run #{run_id} recorded  |  "
         f"duration {duration:.1f}s  |  "
         f"total {len(ids_after)} threats"
+    )
+
+    # 14. Generate and store alerts (Phase 5)
+    print("[alerts] generating alerts...")
+    # Fetch previous runs to compute rolling average for spike detection
+    previous_runs = db.fetch_pipeline_runs(limit=51)  # includes current run
+    # Exclude the run we just recorded (it will be the first in the list, newest first)
+    prev_new_counts = [
+        r["new_threats"] for r in previous_runs
+        if r["run_id"] != run_id and r.get("new_threats") is not None
+    ]
+    alerts = generate_alerts(diff, fresh_rows, run_id,
+                             previous_run_new_counts=prev_new_counts)
+    db.upsert_alerts(alerts)
+    n_critical_alerts = sum(1 for a in alerts if a["severity"] == "critical")
+    n_high_alerts     = sum(1 for a in alerts if a["severity"] == "high")
+    n_warn_alerts     = sum(1 for a in alerts if a["severity"] == "warning")
+    print(
+        f"[alerts] {len(alerts)} alerts generated  |  "
+        f"critical={n_critical_alerts}  high={n_high_alerts}  warning={n_warn_alerts}"
     )
 
     print("\nPipeline complete. Run `streamlit run src/dashboard/app.py` to view the dashboard.")

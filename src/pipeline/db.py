@@ -94,6 +94,20 @@ CREATE TABLE IF NOT EXISTS threat_history (
 );
 """
 
+# Phase 5: alerts table — one row per generated alert, with analyst status tracking.
+ALERTS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS alerts (
+    alert_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    threat_id   TEXT,
+    run_id      INTEGER,
+    alert_type  TEXT NOT NULL,
+    severity    TEXT NOT NULL,
+    message     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'new'
+);
+"""
+
 # Columns added in post-Review-2 phases. Each entry is (column_name, column_def).
 # init_db() applies these as safe ALTER TABLE migrations on existing databases so
 # we never destroy existing data.
@@ -121,6 +135,7 @@ def init_db():
         conn.execute(MITRE_SCHEMA_SQL)       # Phase 3
         conn.execute(PIPELINE_RUNS_SQL)      # Phase 4
         conn.execute(THREAT_HISTORY_SQL)     # Phase 4
+        conn.execute(ALERTS_SCHEMA_SQL)      # Phase 5
         # Safe ALTER TABLE migrations for the threats table.
         existing = {row[1] for row in conn.execute("PRAGMA table_info(threats)").fetchall()}
         for col_name, col_def in _MIGRATION_COLUMNS:
@@ -442,6 +457,87 @@ def count() -> int:
     init_db()
     with get_connection() as conn:
         return conn.execute("SELECT COUNT(*) as c FROM threats").fetchone()["c"]
+
+
+# ── Phase 5: Alerts ───────────────────────────────────────────────────────────
+
+def upsert_alerts(alerts: list):
+    """
+    Insert alerts that don't already exist for the same (threat_id, run_id, alert_type).
+    Idempotent — re-running the pipeline will not create duplicate alerts.
+
+    alerts: list of dicts with keys:
+        threat_id, run_id, alert_type, severity, message
+    """
+    init_db()
+    created_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    with get_connection() as conn:
+        for a in alerts:
+            # Only insert if no existing row matches the unique triple
+            existing = conn.execute(
+                """
+                SELECT alert_id FROM alerts
+                WHERE threat_id=? AND run_id=? AND alert_type=?
+                """,
+                (a.get("threat_id"), a.get("run_id"), a["alert_type"]),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO alerts
+                        (threat_id, run_id, alert_type, severity, message, created_at, status)
+                    VALUES (?, ?, ?, ?, ?, ?, 'new')
+                    """,
+                    (
+                        a.get("threat_id"),
+                        a.get("run_id"),
+                        a["alert_type"],
+                        a["severity"],
+                        a["message"],
+                        created_at,
+                    ),
+                )
+
+
+def fetch_alerts(status_filter: Optional[str] = None, limit: int = 200) -> List[dict]:
+    """
+    Return alerts ordered newest first.
+    status_filter: 'new' | 'acknowledged' | 'dismissed' | None (all)
+    """
+    init_db()
+    with get_connection() as conn:
+        if status_filter:
+            rows = conn.execute(
+                "SELECT * FROM alerts WHERE status=? ORDER BY alert_id DESC LIMIT ?",
+                (status_filter, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM alerts ORDER BY alert_id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def fetch_unacknowledged_alert_count() -> int:
+    """Return the count of alerts with status='new'."""
+    init_db()
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) as c FROM alerts WHERE status='new'"
+        ).fetchone()["c"]
+
+
+def update_alert_status(alert_id: int, status: str):
+    """
+    Update a single alert's status.
+    status must be one of: 'new' | 'acknowledged' | 'dismissed'
+    """
+    assert status in ("new", "acknowledged", "dismissed"), f"Invalid status: {status}"
+    init_db()
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE alerts SET status=? WHERE alert_id=?", (status, alert_id)
+        )
 
 
 if __name__ == "__main__":
