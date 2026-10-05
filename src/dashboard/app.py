@@ -353,10 +353,11 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 #  Tab layout
 # ─────────────────────────────────────────────
-tab_threats, tab_clusters, tab_mitre, tab_models = st.tabs([
+tab_threats, tab_clusters, tab_mitre, tab_monitor, tab_models = st.tabs([
     "🔒 Threats",
     "🔗 Clusters",
     "🧩 MITRE ATT&CK",
+    "📡 Monitoring",
     "🤖 Model Evaluation",
 ])
 
@@ -1365,7 +1366,258 @@ Treat all mappings as investigative starting points.
 
 
 # ══════════════════════════════════════════════
-#  TAB 4 — MODEL EVALUATION  (original content)
+#  TAB 4 — MONITORING  (Phase 4)
+# ══════════════════════════════════════════════
+with tab_monitor:
+    from src.pipeline.db import (
+        fetch_pipeline_runs,
+        fetch_threat_history,
+        fetch_threat_history_for_id,
+    )
+
+    st.markdown("### 📡 Continuous Monitoring")
+    st.markdown("""
+<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:10px;
+            padding:14px 18px;margin-bottom:16px;font-size:0.88rem;color:#c4b5fd;'>
+<b style='color:#a855f7'>How monitoring works</b><br>
+Every pipeline run snapshots the current priority of each threat before and after
+re-scoring. New threats, escalations (priority went up) and reductions (priority
+went down) are recorded in a persistent audit log. This tab lets analysts track
+how the threat landscape changes across runs without manual database inspection.
+<br><br>
+To simulate a new run: <code>python scripts/run_pipeline.py --retrain</code>
+or <code>--synthetic</code> / <code>--live</code>.
+</div>
+""", unsafe_allow_html=True)
+
+    runs     = fetch_pipeline_runs(limit=50)
+    history  = fetch_threat_history(limit=1000)
+    runs_df  = pd.DataFrame(runs)    if runs    else pd.DataFrame()
+    hist_df  = pd.DataFrame(history) if history else pd.DataFrame()
+
+    has_runs    = not runs_df.empty
+    has_history = not hist_df.empty
+
+    # ── Top-level run metrics ──────────────────────────────────────────────
+    if has_runs:
+        latest = runs_df.iloc[0]   # newest run first
+        rm1, rm2, rm3, rm4, rm5 = st.columns(5)
+        rm1.metric("Total Runs",      len(runs_df))
+        rm2.metric("Latest New",      int(latest.get("new_threats",     0)))
+        rm3.metric("Latest Escalated",int(latest.get("updated_threats", 0)))
+        rm4.metric("Total Threats",   int(latest.get("total_threats",   0)))
+        rm5.metric("Last Duration",   f"{latest.get('duration_secs', 0):.1f}s")
+    else:
+        st.info(
+            "No pipeline run history yet. Run the pipeline to start collecting monitoring data:\n\n"
+            "```\npython scripts/run_pipeline.py --retrain\n```"
+        )
+
+    if has_runs:
+        st.divider()
+
+        # ── Run history table ──────────────────────────────────────────────
+        st.markdown("#### Pipeline Run History")
+
+        run_display = runs_df[[
+            c for c in [
+                "run_id", "run_at", "mode", "total_threats",
+                "new_threats", "updated_threats", "unchanged_threats",
+                "n_critical", "n_high", "n_medium", "n_low",
+                "duration_secs", "notes",
+            ] if c in runs_df.columns
+        ]].copy()
+
+        run_rename = {
+            "run_id": "Run #", "run_at": "Timestamp", "mode": "Mode",
+            "total_threats": "Total", "new_threats": "New",
+            "updated_threats": "Changed", "unchanged_threats": "Unchanged",
+            "n_critical": "Critical", "n_high": "High",
+            "n_medium": "Medium", "n_low": "Low",
+            "duration_secs": "Duration (s)", "notes": "Notes",
+        }
+        run_display = run_display.rename(columns=run_rename)
+        if "Timestamp" in run_display.columns:
+            # Trim to readable format
+            run_display["Timestamp"] = run_display["Timestamp"].str[:19].str.replace("T", " ")
+        if "Duration (s)" in run_display.columns:
+            run_display["Duration (s)"] = run_display["Duration (s)"].round(1)
+
+        st.dataframe(run_display, use_container_width=True, hide_index=True)
+
+        # ── New threats per run bar chart ──────────────────────────────────
+        if len(runs_df) >= 2 and "new_threats" in runs_df.columns:
+            st.markdown("#### New Threats per Run")
+            plot_runs = runs_df.sort_values("run_id").tail(20)
+            x_labels  = [f"Run {int(r)}" for r in plot_runs["run_id"]]
+            new_vals  = plot_runs["new_threats"].fillna(0).astype(int).tolist()
+            chg_vals  = plot_runs["updated_threats"].fillna(0).astype(int).tolist()
+
+            fig_r, ax_r = plt.subplots(figsize=(min(10, len(x_labels) + 2), 3.5))
+            fig_r.patch.set_facecolor("#0d0d1a")
+            ax_r.set_facecolor("#130d2e")
+            x_pos = range(len(x_labels))
+            w = 0.38
+            ax_r.bar([x - w/2 for x in x_pos], new_vals,
+                     width=w, color="#7c3aed", label="New", edgecolor="#4a1d96", linewidth=0.6)
+            ax_r.bar([x + w/2 for x in x_pos], chg_vals,
+                     width=w, color="#f97316", label="Priority changed", edgecolor="#4a1d96", linewidth=0.6)
+            ax_r.set_xticks(list(x_pos))
+            ax_r.set_xticklabels(x_labels, rotation=30, ha="right", fontsize=8, color="#c4b5fd")
+            ax_r.set_ylabel("Threats", color="#a78bfa", fontsize=9)
+            ax_r.set_title("New & Changed Threats per Run", color="#c084fc",
+                           fontsize=10, fontweight="bold")
+            ax_r.tick_params(colors="#c4b5fd", labelsize=8)
+            ax_r.spines[:].set_color("#4a1d96")
+            ax_r.legend(facecolor="#1a0a3d", edgecolor="#4a1d96",
+                        labelcolor="#c4b5fd", fontsize=8)
+            plt.tight_layout()
+            st.pyplot(fig_r, use_container_width=True)
+            plt.close(fig_r)
+
+    if has_history:
+        st.divider()
+
+        # ── Threat activity feed ───────────────────────────────────────────
+        st.markdown("#### Threat Activity Feed")
+        st.caption("Most recent priority changes and new threats, across all runs.")
+
+        CHANGE_COLORS = {
+            "new":       ("#052e16", "#86efac", "#166534", "🆕 NEW"),
+            "escalated": ("#4c0519", "#fda4af", "#9f1239", "⬆ ESCALATED"),
+            "reduced":   ("#0c1a4a", "#93c5fd", "#1d4ed8", "⬇ REDUCED"),
+        }
+
+        # Filter controls
+        fc1, fc2 = st.columns([2, 2])
+        change_filter = fc1.multiselect(
+            "Change type",
+            options=["new", "escalated", "reduced"],
+            default=["new", "escalated", "reduced"],
+            key="monitor_change_filter",
+        )
+        feed_limit = fc2.select_slider(
+            "Show last N events", options=[25, 50, 100, 250], value=50,
+            key="monitor_feed_limit",
+        )
+
+        filtered_hist = hist_df[hist_df["change_type"].isin(change_filter)].head(feed_limit)
+
+        if filtered_hist.empty:
+            st.info("No events matching the current filter.")
+        else:
+            for _, ev in filtered_hist.iterrows():
+                ct = ev.get("change_type", "")
+                bg, fg, border, badge = CHANGE_COLORS.get(
+                    ct, ("#1a0a3d", "#c4b5fd", "#4a1d96", ct.upper())
+                )
+                tid       = ev.get("threat_id", "")
+                title     = ev.get("title") or tid
+                src       = ev.get("source", "")
+                sev       = ev.get("severity_raw", "")
+                prev_p    = ev.get("previous_priority") or "—"
+                new_p     = ev.get("new_priority") or "—"
+                run_at    = str(ev.get("run_at", ""))[:19].replace("T", " ")
+                run_id    = ev.get("run_id", "")
+
+                p_arrow = ""
+                if ct == "escalated":
+                    p_arrow = f"<span style='color:#fda4af;'>{prev_p} → <b>{new_p}</b></span>"
+                elif ct == "reduced":
+                    p_arrow = f"<span style='color:#93c5fd;'>{prev_p} → <b>{new_p}</b></span>"
+                else:
+                    p_arrow = f"<span style='color:#86efac;'>Priority: <b>{new_p}</b></span>"
+
+                sev_str = f" · Sev {float(sev):.1f}/10" if sev != "" else ""
+
+                st.markdown(
+                    f"""
+<div style='background:{bg};border:1px solid {border};border-left:4px solid {border};
+            border-radius:8px;padding:10px 16px;margin-bottom:6px;
+            display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;'>
+  <span style='background:{border};color:{fg};border-radius:10px;
+               padding:2px 8px;font-size:0.7rem;font-weight:700;
+               letter-spacing:0.5px;white-space:nowrap;'>{badge}</span>
+  <div style='flex:1;min-width:200px;'>
+    <span style='color:#e9d5ff;font-weight:600;font-size:0.9rem;'>{title[:70]}</span>
+    <div style='color:#9f7aea;font-size:0.8rem;margin-top:2px;'>
+      {p_arrow}
+      <span style='color:#7c5cbf;margin-left:8px;'>
+        {src}{sev_str} · Run #{run_id} · {run_at}
+      </span>
+    </div>
+  </div>
+</div>""",
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+
+        # ── Per-threat history lookup ──────────────────────────────────────
+        st.markdown("#### Threat History Lookup")
+        st.caption("Track how a specific threat's priority has changed over time.")
+
+        threat_ids_with_history = sorted(hist_df["threat_id"].unique().tolist())
+        if threat_ids_with_history:
+            sel_hist_id = st.selectbox(
+                "Select a threat",
+                options=threat_ids_with_history,
+                format_func=lambda x: f"{x[:70]}..." if len(str(x)) > 70 else x,
+                key="monitor_threat_select",
+            )
+            threat_hist = fetch_threat_history_for_id(sel_hist_id)
+            if threat_hist:
+                th_df = pd.DataFrame(threat_hist)[[
+                    "run_id", "run_at", "change_type",
+                    "previous_priority", "new_priority",
+                    "previous_score",   "new_score",
+                ]]
+                th_df = th_df.rename(columns={
+                    "run_id": "Run #", "run_at": "Timestamp",
+                    "change_type": "Change", "previous_priority": "Previous Priority",
+                    "new_priority": "New Priority", "previous_score": "Prev Score",
+                    "new_score": "New Score",
+                })
+                if "Timestamp" in th_df.columns:
+                    th_df["Timestamp"] = th_df["Timestamp"].str[:19].str.replace("T", " ")
+                for sc in ("Prev Score", "New Score"):
+                    if sc in th_df.columns:
+                        th_df[sc] = th_df[sc].apply(
+                            lambda v: round(float(v), 4) if v is not None else "—"
+                        )
+                st.dataframe(th_df, use_container_width=True, hide_index=True)
+
+                # Mini timeline chart if multiple history entries
+                if len(threat_hist) >= 2:
+                    scores = [
+                        float(r["new_score"]) if r.get("new_score") is not None else None
+                        for r in threat_hist
+                    ]
+                    run_labels = [f"Run {r['run_id']}" for r in threat_hist]
+                    valid = [(lbl, s) for lbl, s in zip(run_labels, scores) if s is not None]
+                    if len(valid) >= 2:
+                        lbl_v, sc_v = zip(*valid)
+                        fig_h, ax_h = plt.subplots(figsize=(min(8, len(valid) + 1), 2.8))
+                        fig_h.patch.set_facecolor("#0d0d1a")
+                        ax_h.set_facecolor("#130d2e")
+                        ax_h.plot(lbl_v, sc_v, color="#a855f7", linewidth=2,
+                                  marker="o", markersize=6, markerfacecolor="#c084fc")
+                        ax_h.set_ylim(0, 1.05)
+                        ax_h.set_ylabel("Priority Score", color="#a78bfa", fontsize=9)
+                        ax_h.set_title(
+                            f"Priority Score History — {sel_hist_id[:40]}",
+                            color="#c084fc", fontsize=9, fontweight="bold",
+                        )
+                        ax_h.tick_params(colors="#c4b5fd", labelsize=8)
+                        ax_h.spines[:].set_color("#4a1d96")
+                        plt.xticks(rotation=20, ha="right")
+                        plt.tight_layout()
+                        st.pyplot(fig_h, use_container_width=True)
+                        plt.close(fig_h)
+
+
+# ══════════════════════════════════════════════
+#  TAB 5 — MODEL EVALUATION  (original content)
 # ══════════════════════════════════════════════
 with tab_models:
     metrics_path = REPORTS_DIR / "metrics.json"

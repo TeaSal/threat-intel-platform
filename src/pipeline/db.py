@@ -8,9 +8,16 @@ ATT&CK technique associations. It is kept separate from `threats` so that:
   - The threats table schema stays clean and backward-compatible.
   - One threat can map to multiple techniques (one-to-many relationship).
   - Mappings can be updated independently without touching the threat record.
+
+Phase 4 adds two monitoring tables:
+  - `pipeline_runs`  — one row per pipeline execution, records timing and
+                       high-level stats (new/updated/unchanged threat counts).
+  - `threat_history` — audit log; one row per (threat_id, run_id) whenever a
+                       threat's predicted_priority changes between runs.
 """
 import sqlite3
 import json
+import datetime as dt
 from typing import List, Optional
 from contextlib import contextmanager
 
@@ -53,6 +60,40 @@ CREATE TABLE IF NOT EXISTS mitre_mappings (
 );
 """
 
+# Phase 4: pipeline run log — one row per execution.
+PIPELINE_RUNS_SQL = """
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    run_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at          TEXT NOT NULL,
+    mode            TEXT NOT NULL,
+    total_threats   INTEGER,
+    new_threats     INTEGER,
+    updated_threats INTEGER,
+    unchanged_threats INTEGER,
+    n_critical      INTEGER,
+    n_high          INTEGER,
+    n_medium        INTEGER,
+    n_low           INTEGER,
+    duration_secs   REAL,
+    notes           TEXT
+);
+"""
+
+# Phase 4: per-threat priority change audit log.
+THREAT_HISTORY_SQL = """
+CREATE TABLE IF NOT EXISTS threat_history (
+    history_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    threat_id       TEXT NOT NULL,
+    run_id          INTEGER NOT NULL,
+    run_at          TEXT NOT NULL,
+    previous_priority TEXT,
+    new_priority      TEXT,
+    previous_score    REAL,
+    new_score         REAL,
+    change_type       TEXT NOT NULL
+);
+"""
+
 # Columns added in post-Review-2 phases. Each entry is (column_name, column_def).
 # init_db() applies these as safe ALTER TABLE migrations on existing databases so
 # we never destroy existing data.
@@ -74,13 +115,13 @@ def get_connection():
 
 
 def init_db():
-    """Create the threats table if it doesn't exist, then apply any pending column migrations."""
+    """Create all tables if they don't exist, then apply any pending column migrations."""
     with get_connection() as conn:
         conn.execute(SCHEMA_SQL)
-        conn.execute(MITRE_SCHEMA_SQL)   # Phase 3: MITRE mappings table
-        # Safe ALTER TABLE migrations: add columns introduced after Review 2.
-        # SQLite does not support IF NOT EXISTS on ALTER TABLE, so we query
-        # existing columns and only add the ones that are missing.
+        conn.execute(MITRE_SCHEMA_SQL)       # Phase 3
+        conn.execute(PIPELINE_RUNS_SQL)      # Phase 4
+        conn.execute(THREAT_HISTORY_SQL)     # Phase 4
+        # Safe ALTER TABLE migrations for the threats table.
         existing = {row[1] for row in conn.execute("PRAGMA table_info(threats)").fetchall()}
         for col_name, col_def in _MIGRATION_COLUMNS:
             if col_name not in existing:
@@ -200,6 +241,194 @@ def count_mitre_mappings() -> int:
     init_db()
     with get_connection() as conn:
         return conn.execute("SELECT COUNT(*) as c FROM mitre_mappings").fetchone()["c"]
+
+
+# ── Phase 4: Monitoring / Continuous Ingestion ────────────────────────────────
+
+def snapshot_priorities() -> dict:
+    """
+    Returns {threat_id: (predicted_priority, predicted_priority_score)}
+    for every row currently in the threats table.
+    Called BEFORE upsert/predictions so we can diff against the new values.
+    """
+    init_db()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, predicted_priority, predicted_priority_score FROM threats"
+        ).fetchall()
+    return {
+        r["id"]: (r["predicted_priority"], r["predicted_priority_score"])
+        for r in rows
+    }
+
+
+def diff_threats(before_ids: set, after_ids: set,
+                 before_priorities: dict, after_priorities: dict) -> dict:
+    """
+    Compares two snapshots and categorises every threat as:
+      new       — id appeared for the first time in this run
+      escalated — priority went up   (e.g. Medium → High)
+      reduced   — priority went down (e.g. High → Medium)
+      unchanged — in DB before and priority did not change
+
+    Parameters
+    ----------
+    before_ids        : set of threat IDs present before collection
+    after_ids         : set of threat IDs present after collection
+    before_priorities : {id: (priority, score)} before predictions
+    after_priorities  : {id: (priority, score)} after predictions
+
+    Returns
+    -------
+    dict with keys: new, escalated, reduced, unchanged
+    Each value is a list of dicts with full diff details.
+    """
+    PRIORITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
+    result = {"new": [], "escalated": [], "reduced": [], "unchanged": []}
+
+    for tid in after_ids:
+        after_p, after_s = after_priorities.get(tid, (None, None))
+        if tid not in before_ids:
+            result["new"].append({
+                "threat_id": tid,
+                "change_type": "new",
+                "previous_priority": None,
+                "new_priority": after_p,
+                "previous_score": None,
+                "new_score": after_s,
+            })
+        else:
+            before_p, before_s = before_priorities.get(tid, (None, None))
+            br = PRIORITY_RANK.get(before_p, 0)
+            ar = PRIORITY_RANK.get(after_p, 0)
+            if ar > br:
+                result["escalated"].append({
+                    "threat_id": tid,
+                    "change_type": "escalated",
+                    "previous_priority": before_p,
+                    "new_priority": after_p,
+                    "previous_score": before_s,
+                    "new_score": after_s,
+                })
+            elif ar < br:
+                result["reduced"].append({
+                    "threat_id": tid,
+                    "change_type": "reduced",
+                    "previous_priority": before_p,
+                    "new_priority": after_p,
+                    "previous_score": before_s,
+                    "new_score": after_s,
+                })
+            else:
+                result["unchanged"].append({
+                    "threat_id": tid,
+                    "change_type": "unchanged",
+                    "previous_priority": before_p,
+                    "new_priority": after_p,
+                    "previous_score": before_s,
+                    "new_score": after_s,
+                })
+
+    return result
+
+
+def record_pipeline_run(
+    mode: str,
+    total_threats: int,
+    new_threats: int,
+    updated_threats: int,
+    unchanged_threats: int,
+    n_critical: int,
+    n_high: int,
+    n_medium: int,
+    n_low: int,
+    duration_secs: float,
+    notes: str = "",
+) -> int:
+    """Insert a pipeline_runs row and return the new run_id."""
+    init_db()
+    run_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO pipeline_runs
+                (run_at, mode, total_threats, new_threats, updated_threats,
+                 unchanged_threats, n_critical, n_high, n_medium, n_low,
+                 duration_secs, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (run_at, mode, total_threats, new_threats, updated_threats,
+             unchanged_threats, n_critical, n_high, n_medium, n_low,
+             round(duration_secs, 2), notes),
+        )
+        return cur.lastrowid
+
+
+def record_threat_history(run_id: int, diff_entries: list):
+    """
+    Insert rows into threat_history for all changed threats.
+    diff_entries: list of dicts from diff_threats() — all change_types.
+    """
+    init_db()
+    run_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    with get_connection() as conn:
+        for entry in diff_entries:
+            if entry["change_type"] == "unchanged":
+                continue   # only record actual changes + new threats
+            conn.execute(
+                """
+                INSERT INTO threat_history
+                    (threat_id, run_id, run_at, previous_priority, new_priority,
+                     previous_score, new_score, change_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry["threat_id"], run_id, run_at,
+                    entry.get("previous_priority"),
+                    entry.get("new_priority"),
+                    entry.get("previous_score"),
+                    entry.get("new_score"),
+                    entry["change_type"],
+                ),
+            )
+
+
+def fetch_pipeline_runs(limit: int = 50) -> List[dict]:
+    """Return the most recent pipeline runs, newest first."""
+    init_db()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM pipeline_runs ORDER BY run_id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def fetch_threat_history(limit: int = 500) -> List[dict]:
+    """Return recent threat history entries (new + priority changes), newest first."""
+    init_db()
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT th.*, t.title, t.threat_type, t.source, t.severity_raw
+            FROM threat_history th
+            LEFT JOIN threats t ON t.id = th.threat_id
+            ORDER BY th.history_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def fetch_threat_history_for_id(threat_id: str) -> List[dict]:
+    """Return all history rows for a specific threat, oldest first."""
+    init_db()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM threat_history WHERE threat_id=? ORDER BY history_id ASC",
+            (threat_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def fetch_all_as_dicts() -> List[dict]:

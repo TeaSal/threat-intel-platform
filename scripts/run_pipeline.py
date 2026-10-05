@@ -1,12 +1,13 @@
 """
 Orchestrates the full pipeline end-to-end:
-collect -> normalize -> dedup -> store -> feature-engineer -> label -> train -> evaluate -> write predictions
+collect -> normalize -> dedup -> store -> feature-engineer -> label -> train -> evaluate -> write predictions -> cluster -> summarize -> mitre -> monitor
 
 Usage:
     python scripts/run_pipeline.py --synthetic     # offline, no API keys / internet needed
     python scripts/run_pipeline.py --live           # real NVD + AbuseIPDB APIs (needs keys + internet)
 """
 import sys
+import time
 import argparse
 from pathlib import Path
 
@@ -50,6 +51,14 @@ def main():
     parser.add_argument("--n-cves", type=int, default=300)
     parser.add_argument("--n-ips", type=int, default=300)
     args = parser.parse_args()
+
+    pipeline_start = time.time()
+    run_mode = "synthetic" if args.synthetic else "live" if args.live else "retrain"
+
+    # ── Phase 4: snapshot state BEFORE this run ────────────────────────────
+    db.init_db()   # ensure tables exist before snapshot
+    ids_before        = set(r["id"] for r in db.fetch_all_as_dicts())
+    priorities_before = db.snapshot_priorities()
 
     # 1. Collect
     if args.retrain:
@@ -106,26 +115,51 @@ def main():
     pred_probs = best_model.predict_proba(X_all)
 
     # IMPORTANT: the score we rank by must reflect PRIORITY, not model confidence.
-    # Using predict_proba().max() would rank "Low, 100% confident" above
-    # "High, 90% confident" -- wrong for an analyst triage view. Instead we compute
-    # an expected-severity score: each class's probability weighted by its severity
-    # rank (Low=0 .. Critical=3), summed. This is monotonic with actual priority
-    # and still reflects the model's uncertainty across classes.
     severity_rank = {"Low": 0, "Medium": 1, "High": 2, "Critical": 3}
     class_order = list(best_model.classes_)
     weights = [severity_rank[c] for c in class_order]
-    # Always divide by 3 (Critical's rank) regardless of which classes are
-    # present in this run — avoids scores of 1.0 when Critical is absent.
-    expected_severity = (pred_probs * weights).sum(axis=1) / 3.0  # normalize to 0-1
+    expected_severity = (pred_probs * weights).sum(axis=1) / 3.0
 
     id_to_prediction = dict(zip(labeled["id"], zip(pred_labels, expected_severity)))
     db.update_predictions(id_to_prediction)
     print(f"[predict] wrote predictions to DB using {best_model_name} "
           f"(ranking score = probability-weighted expected severity, not raw confidence)")
 
+    # ── Phase 4: diff old vs new priorities + record history ──────────────
+    ids_after        = set(labeled["id"].tolist())
+    priorities_after = {
+        tid: (label, float(score))
+        for tid, (label, score) in id_to_prediction.items()
+    }
+    diff = db.diff_threats(ids_before, ids_after, priorities_before, priorities_after)
+    n_new       = len(diff["new"])
+    n_escalated = len(diff["escalated"])
+    n_reduced   = len(diff["reduced"])
+    n_unchanged = len(diff["unchanged"])
+
+    all_diff_entries = (
+        diff["new"] + diff["escalated"] + diff["reduced"] + diff["unchanged"]
+    )
+
+    # Compute priority breakdown from current predictions
+    priority_counts = pd.Series(pred_labels).value_counts()
+    n_critical = int(priority_counts.get("Critical", 0))
+    n_high     = int(priority_counts.get("High",     0))
+    n_medium   = int(priority_counts.get("Medium",   0))
+    n_low      = int(priority_counts.get("Low",      0))
+
+    print(
+        f"[monitor] this run: {n_new} new  |  "
+        f"{n_escalated} escalated  |  {n_reduced} reduced  |  "
+        f"{n_unchanged} unchanged"
+    )
+    if n_escalated:
+        escalated_ids = [e["threat_id"] for e in diff["escalated"]]
+        print(f"[monitor] escalated threats: {escalated_ids[:5]}"
+              + (" ..." if len(escalated_ids) > 5 else ""))
+
     # 10. Cluster threats
     print("[cluster] running threat clustering...")
-    # Attach source + threat_type + description back for richer text features
     rows_df = pd.DataFrame(rows)[["id", "source", "threat_type", "description"]]
     labeled_with_meta = labeled.merge(rows_df, on="id", how="left")
     id_to_cluster, cluster_summary, n_clusters = cluster_threats(labeled_with_meta)
@@ -134,14 +168,14 @@ def main():
 
     # 11. Generate AI summaries for every threat record
     print("[summarize] generating AI threat summaries...")
-    fresh_rows = db.fetch_all_as_dicts()          # re-fetch so summaries see cluster_id + priority
+    fresh_rows = db.fetch_all_as_dicts()
     id_to_summary = generate_all_summaries(fresh_rows)
     db.update_summaries(id_to_summary)
     print(f"[summarize] wrote summaries for {len(id_to_summary)} threats")
 
     # 12. MITRE ATT&CK mapping
     print("[mitre] inferring MITRE ATT&CK technique mappings...")
-    mitre_rows = db.fetch_all_as_dicts()   # same fresh snapshot used for summaries
+    mitre_rows = db.fetch_all_as_dicts()
     mitre_mappings, mitre_stats = map_all_threats(mitre_rows)
     db.upsert_mitre_mappings(mitre_mappings)
     print(
@@ -154,6 +188,31 @@ def main():
     if mitre_stats["top_tactics"]:
         print("[mitre] top tactics: " +
               ", ".join(f"{t}({n})" for t, n in mitre_stats["top_tactics"]))
+
+    # 13. Record this pipeline run + threat history (Phase 4)
+    duration = time.time() - pipeline_start
+    run_id = db.record_pipeline_run(
+        mode=run_mode,
+        total_threats=len(ids_after),
+        new_threats=n_new,
+        updated_threats=n_escalated + n_reduced,
+        unchanged_threats=n_unchanged,
+        n_critical=n_critical,
+        n_high=n_high,
+        n_medium=n_medium,
+        n_low=n_low,
+        duration_secs=duration,
+        notes=(
+            f"escalated={n_escalated}, reduced={n_reduced}, "
+            f"RF_accuracy={metrics.get('random_forest', {}).get('accuracy', 0):.3f}"
+        ),
+    )
+    db.record_threat_history(run_id, all_diff_entries)
+    print(
+        f"[monitor] run #{run_id} recorded  |  "
+        f"duration {duration:.1f}s  |  "
+        f"total {len(ids_after)} threats"
+    )
 
     print("\nPipeline complete. Run `streamlit run src/dashboard/app.py` to view the dashboard.")
 
