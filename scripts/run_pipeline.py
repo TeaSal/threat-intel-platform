@@ -12,11 +12,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pandas as pd
+
 from src.pipeline.normalize import normalize_batch
 from src.pipeline.dedup import deduplicate
 from src.pipeline import db
 from src.pipeline.feature_engineering import build_feature_matrix
 from src.pipeline.labeling import apply_heuristic_labels
+from src.pipeline.clustering import cluster_threats
+from src.pipeline.summarizer import generate_all_summaries
+from src.pipeline.mitre_mapper import map_all_threats
 from src.ml.train import train_all_models
 from src.ml.evaluate import evaluate_all
 
@@ -117,6 +122,38 @@ def main():
     db.update_predictions(id_to_prediction)
     print(f"[predict] wrote predictions to DB using {best_model_name} "
           f"(ranking score = probability-weighted expected severity, not raw confidence)")
+
+    # 10. Cluster threats
+    print("[cluster] running threat clustering...")
+    # Attach source + threat_type + description back for richer text features
+    rows_df = pd.DataFrame(rows)[["id", "source", "threat_type", "description"]]
+    labeled_with_meta = labeled.merge(rows_df, on="id", how="left")
+    id_to_cluster, cluster_summary, n_clusters = cluster_threats(labeled_with_meta)
+    db.update_cluster_ids(id_to_cluster)
+    print(f"[cluster] assigned {len(id_to_cluster)} threats to {n_clusters} clusters")
+
+    # 11. Generate AI summaries for every threat record
+    print("[summarize] generating AI threat summaries...")
+    fresh_rows = db.fetch_all_as_dicts()          # re-fetch so summaries see cluster_id + priority
+    id_to_summary = generate_all_summaries(fresh_rows)
+    db.update_summaries(id_to_summary)
+    print(f"[summarize] wrote summaries for {len(id_to_summary)} threats")
+
+    # 12. MITRE ATT&CK mapping
+    print("[mitre] inferring MITRE ATT&CK technique mappings...")
+    mitre_rows = db.fetch_all_as_dicts()   # same fresh snapshot used for summaries
+    mitre_mappings, mitre_stats = map_all_threats(mitre_rows)
+    db.upsert_mitre_mappings(mitre_mappings)
+    print(
+        f"[mitre] {mitre_stats['total_mappings']} mappings across "
+        f"{mitre_stats['threats_mapped']} threats  "
+        f"(High={mitre_stats['by_confidence']['High']}, "
+        f"Medium={mitre_stats['by_confidence']['Medium']}, "
+        f"Low={mitre_stats['by_confidence']['Low']})"
+    )
+    if mitre_stats["top_tactics"]:
+        print("[mitre] top tactics: " +
+              ", ".join(f"{t}({n})" for t, n in mitre_stats["top_tactics"]))
 
     print("\nPipeline complete. Run `streamlit run src/dashboard/app.py` to view the dashboard.")
 
