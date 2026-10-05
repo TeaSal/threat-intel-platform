@@ -112,8 +112,9 @@ CREATE TABLE IF NOT EXISTS alerts (
 # init_db() applies these as safe ALTER TABLE migrations on existing databases so
 # we never destroy existing data.
 _MIGRATION_COLUMNS = [
-    ("cluster_id",  "INTEGER"),
-    ("ai_summary",  "TEXT"),      # Phase 2: template-based analyst summary
+    ("cluster_id",       "INTEGER"),
+    ("ai_summary",       "TEXT"),      # Phase 2: template-based analyst summary
+    ("explanation_json", "TEXT"),      # Phase 8: ML feature-contribution explanation
 ]
 
 
@@ -457,6 +458,19 @@ def count() -> int:
     init_db()
     with get_connection() as conn:
         return conn.execute("SELECT COUNT(*) as c FROM threats").fetchone()["c"]
+
+
+def update_explanations(id_to_explanation: dict):
+    """
+    id_to_explanation: {threat_id: explanation_dict}  — Phase 8
+    Serialises each explanation dict to JSON and stores it in explanation_json column.
+    """
+    with get_connection() as conn:
+        for tid, exp in id_to_explanation.items():
+            conn.execute(
+                "UPDATE threats SET explanation_json=? WHERE id=?",
+                (json.dumps(exp), tid),
+            )
 
 
 # ── Phase 5: Alerts ───────────────────────────────────────────────────────────

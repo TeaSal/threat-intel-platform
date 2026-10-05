@@ -660,6 +660,129 @@ with tab_threats:
 
         st.divider()
 
+        # ── Phase 8: Why this priority? ────────────────────────────────────
+        st.markdown("##### 🔍 Why This Priority?")
+        st.caption(
+            "Feature contribution analysis — shows which input signals most influenced "
+            "the ML model's priority assignment. Derived from the Random Forest's own "
+            "feature importances, not a post-hoc approximation."
+        )
+
+        explanation_json_raw = record.get("explanation_json")
+        exp_data = None
+        if explanation_json_raw:
+            try:
+                exp_data = json.loads(explanation_json_raw) if isinstance(explanation_json_raw, str) else explanation_json_raw
+            except (ValueError, TypeError):
+                exp_data = None
+
+        if not exp_data:
+            # Generate on-the-fly if pipeline hasn't written it yet
+            try:
+                import joblib as _joblib
+                from src.pipeline.explainer import explain_prediction as _explain_pred
+                from src.pipeline.feature_engineering import build_feature_matrix as _build_feat
+                from src.config import MODELS_DIR as _MODELS_DIR
+                _model = _joblib.load(_MODELS_DIR / "random_forest.joblib")
+                _feats, _fcols = _build_feat([dict(record)])
+                if not _feats.empty:
+                    _row_dict = _feats.iloc[0].to_dict()
+                    _row_dict.update({k: v for k, v in dict(record).items() if k not in _row_dict})
+                    exp_data = _explain_pred(_row_dict, _model, _fcols)
+            except Exception:
+                exp_data = None
+
+        if not exp_data:
+            st.markdown(
+                "<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:8px;"
+                "padding:12px 16px;color:#7c5cbf;font-size:0.86rem;'>"
+                "Explanation not available yet. Re-run the pipeline to generate explanations."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            # Plain-English summary
+            plain = exp_data.get("plain_english", "")
+            method_label = "SHAP" if exp_data.get("method") == "shap" else "Feature Contribution"
+            confidence = exp_data.get("confidence", 0)
+
+            st.markdown(
+                f"<div style='background:#0a2218;border:1px solid #166534;border-left:4px solid #166534;"
+                f"border-radius:8px;padding:12px 16px;margin-bottom:12px;'>"
+                f"<span style='color:#86efac;font-weight:700;font-size:0.9rem;'>💡 </span>"
+                f"<span style='color:#d1fae5;font-size:0.9rem;'>{plain}</span>"
+                f"<span style='color:#5b21b6;font-size:0.76rem;margin-left:10px;'>[{method_label}]</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Horizontal bar chart of top-5 feature contributions
+            top_feats = exp_data.get("top_features", [])
+            if top_feats:
+                feat_labels = [f["label"] for f in top_feats]
+                feat_contribs = [f["contribution"] for f in top_feats]
+                feat_values   = [f["value"]        for f in top_feats]
+                bar_colors    = [
+                    "#86efac" if c >= 0 else "#fda4af"
+                    for c in feat_contribs
+                ]
+
+                fig_exp, ax_exp = plt.subplots(figsize=(7, max(2.2, len(top_feats) * 0.55)))
+                fig_exp.patch.set_facecolor("#0d0d1a")
+                ax_exp.set_facecolor("#130d2e")
+                bars = ax_exp.barh(
+                    feat_labels[::-1], [abs(c) for c in feat_contribs[::-1]],
+                    color=bar_colors[::-1], edgecolor="#4a1d96", linewidth=0.7,
+                )
+                ax_exp.set_xlabel("Contribution (absolute)", color="#a78bfa", fontsize=8)
+                ax_exp.set_title(
+                    f"Top Feature Contributions → {exp_data.get('predicted_class','?')}",
+                    color="#c084fc", fontsize=10, fontweight="bold",
+                )
+                ax_exp.tick_params(colors="#c4b5fd", labelsize=8)
+                ax_exp.spines[:].set_color("#4a1d96")
+                # Annotate each bar with the actual feature value
+                for bar, val, contrib in zip(bars, feat_values[::-1], feat_contribs[::-1]):
+                    sign = "+" if contrib >= 0 else "−"
+                    ax_exp.text(
+                        bar.get_width() + 0.001,
+                        bar.get_y() + bar.get_height() / 2,
+                        f"{sign}  val={val:.3f}",
+                        va="center", color="#c4b5fd", fontsize=7.5,
+                    )
+                plt.tight_layout(pad=0.4)
+                st.pyplot(fig_exp, use_container_width=True)
+                plt.close(fig_exp)
+
+                # Feature table
+                tbl_rows = ""
+                for f in top_feats:
+                    dirn_col = "#86efac" if f["direction"] == "+" else "#fda4af"
+                    tbl_rows += (
+                        f"<tr>"
+                        f"<td style='color:#c4b5fd;'>{f['label']}</td>"
+                        f"<td style='text-align:right;'>{f['value']:.4f}</td>"
+                        f"<td style='text-align:right;color:{dirn_col};font-weight:700;'>"
+                        f"{f['direction']}{abs(f['contribution']):.4f}</td>"
+                        f"</tr>"
+                    )
+                st.markdown(
+                    "<div style='margin-top:8px;'>"
+                    "<table style='width:100%;border-collapse:collapse;font-size:0.82rem;'>"
+                    "<thead><tr>"
+                    "<th style='color:#a78bfa;font-weight:700;text-align:left;padding:4px 8px;"
+                    "border-bottom:1px solid #4a1d96;'>Feature</th>"
+                    "<th style='color:#a78bfa;font-weight:700;text-align:right;padding:4px 8px;"
+                    "border-bottom:1px solid #4a1d96;'>Value</th>"
+                    "<th style='color:#a78bfa;font-weight:700;text-align:right;padding:4px 8px;"
+                    "border-bottom:1px solid #4a1d96;'>Contribution</th>"
+                    "</tr></thead>"
+                    f"<tbody>{tbl_rows}</tbody></table></div>",
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+
         # ── MITRE ATT&CK mappings for this specific threat ─────────────────
         st.markdown("##### 🧩 MITRE ATT&CK Associations")
 

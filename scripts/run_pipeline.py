@@ -24,6 +24,7 @@ from src.pipeline.clustering import cluster_threats
 from src.pipeline.summarizer import generate_all_summaries
 from src.pipeline.mitre_mapper import map_all_threats
 from src.pipeline.alerting import generate_alerts
+from src.pipeline.explainer import explain_all
 from src.ml.train import train_all_models
 from src.ml.evaluate import evaluate_all
 
@@ -256,6 +257,13 @@ def main():
         f"[alerts] {len(alerts)} alerts generated  |  "
         f"critical={n_critical_alerts}  high={n_high_alerts}  warning={n_warn_alerts}"
     )
+
+    # 15. Generate and store ML explanations (Phase 8)
+    print("[explain] generating ML prediction explanations...")
+    explain_rows = db.fetch_all_as_dicts()
+    id_to_explanation = explain_all(explain_rows, best_model, feature_cols)
+    db.update_explanations(id_to_explanation)
+    print(f"[explain] wrote explanations for {len(id_to_explanation)} threats")
 
     print("\nPipeline complete. Run `streamlit run src/dashboard/app.py` to view the dashboard.")
 
