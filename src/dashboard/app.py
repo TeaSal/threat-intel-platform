@@ -1626,6 +1626,137 @@ or <code>--synthetic</code> / <code>--live</code>.
                         plt.close(fig_h)
 
 
+    # ── Phase 6: Reports ──────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📄 Generate Intelligence Report")
+    st.markdown("""
+<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:10px;
+            padding:14px 18px;margin-bottom:16px;font-size:0.88rem;color:#c4b5fd;'>
+<b style='color:#a855f7'>About reports</b><br>
+Generates a self-contained HTML file with embedded charts covering the full threat
+landscape — executive summary, priority breakdown, top threats, priority changes,
+cluster summary, MITRE ATT&CK coverage, alerts, and a full threat appendix.<br><br>
+Reports are reproducible from the DB alone (no external API calls).
+Each report is saved to <code>reports/</code> with a timestamp filename.
+</div>
+""", unsafe_allow_html=True)
+
+    from src.pipeline.reporter import generate_html_report as _gen_report
+    from src.pipeline.db import fetch_all_mitre_mappings as _fetch_all_mitre
+    from src.pipeline.db import fetch_alerts as _fetch_alerts_report
+    import datetime as _dt
+
+    # ── Date-range / run scope selector ───────────────────────────────────
+    report_run_filter = None
+    if has_runs and len(runs_df) > 1:
+        run_ids_available = sorted(runs_df["run_id"].tolist())
+        rr1, rr2 = st.columns(2)
+        scope_mode = rr1.radio(
+            "Report scope",
+            options=["All runs", "Select specific runs"],
+            horizontal=True,
+            key="report_scope_mode",
+        )
+        if scope_mode == "Select specific runs":
+            selected_run_ids = rr2.multiselect(
+                "Include runs",
+                options=run_ids_available,
+                default=run_ids_available[-3:] if len(run_ids_available) >= 3
+                        else run_ids_available,
+                key="report_run_select",
+            )
+            if selected_run_ids:
+                report_run_filter = set(selected_run_ids)
+
+    # ── Generate button ────────────────────────────────────────────────────
+    gen_col, _ = st.columns([2, 6])
+    if gen_col.button("📄 Generate Report", key="gen_report_btn", type="primary"):
+        with st.spinner("Building report — this may take a few seconds..."):
+            _r_rows    = db.fetch_all_as_dicts()
+            _r_runs    = db.fetch_pipeline_runs(limit=50)
+            _r_history = db.fetch_threat_history(limit=2000)
+            _r_mitre   = _fetch_all_mitre()
+            _r_alerts  = _fetch_alerts_report(limit=500)
+
+            _html = _gen_report(
+                rows=_r_rows,
+                runs=_r_runs,
+                history=_r_history,
+                mitre=_r_mitre,
+                alerts=_r_alerts,
+                run_filter_ids=report_run_filter,
+            )
+
+            # Save to reports/ directory
+            _ts        = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            _out_path  = REPORTS_DIR / f"threat_report_{_ts}.html"
+            _out_path.write_text(_html, encoding="utf-8")
+
+            # Store in session state for download button
+            st.session_state["last_report_html"]     = _html
+            st.session_state["last_report_filename"]  = f"threat_report_{_ts}.html"
+            st.session_state["last_report_timestamp"] = _ts
+            st.session_state["last_report_path"]      = str(_out_path)
+
+        st.success(f"Report generated and saved to `{_out_path.name}`")
+
+    # ── Download button (shown after generation) ───────────────────────────
+    if "last_report_html" in st.session_state:
+        dl_col1, dl_col2, _ = st.columns([2.5, 2.5, 3])
+        dl_col1.download_button(
+            label="⬇ Download HTML Report",
+            data=st.session_state["last_report_html"].encode("utf-8"),
+            file_name=st.session_state["last_report_filename"],
+            mime="text/html",
+            key="download_report_btn",
+        )
+        dl_col2.markdown(
+            f"<div style='color:#9f7aea;font-size:0.82rem;padding-top:8px;'>"
+            f"Generated: {st.session_state['last_report_timestamp']}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div style='color:#5b21b6;font-size:0.78rem;margin-top:4px;'>"
+            f"Saved to: <code>{st.session_state['last_report_path']}</code></div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── Saved reports list ─────────────────────────────────────────────────
+    st.markdown("#### Saved Reports")
+    saved_reports = sorted(REPORTS_DIR.glob("threat_report_*.html"), reverse=True)
+    if not saved_reports:
+        st.caption("No saved reports yet — click 'Generate Report' above.")
+    else:
+        st.caption(f"{len(saved_reports)} report(s) saved in `reports/`")
+        for rpt in saved_reports[:10]:
+            size_kb = rpt.stat().st_size / 1024
+            # Parse timestamp from filename for display
+            stem_parts = rpt.stem.replace("threat_report_", "")
+            try:
+                rpt_dt = _dt.datetime.strptime(stem_parts, "%Y%m%d_%H%M%S")
+                rpt_label = rpt_dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                rpt_label = stem_parts
+
+            rc1, rc2, rc3 = st.columns([3, 1.5, 2])
+            rc1.markdown(
+                f"<span style='color:#c4b5fd;font-size:0.88rem;'>{rpt.name}</span>",
+                unsafe_allow_html=True,
+            )
+            rc2.markdown(
+                f"<span style='color:#7c5cbf;font-size:0.82rem;'>{size_kb:.0f} KB</span>",
+                unsafe_allow_html=True,
+            )
+            # Offer re-download of saved file
+            rc3.download_button(
+                label="⬇ Download",
+                data=rpt.read_bytes(),
+                file_name=rpt.name,
+                mime="text/html",
+                key=f"dl_saved_{rpt.name}",
+            )
+
+
 # ══════════════════════════════════════════════
 #  TAB 5 — ALERTS  (Phase 5)
 # ══════════════════════════════════════════════
