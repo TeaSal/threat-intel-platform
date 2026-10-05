@@ -18,12 +18,14 @@ for d in (DATA_DIR, MODELS_DIR, REPORTS_DIR):
 DB_PATH = DATA_DIR / "threat_intel.db"
 
 # --- API credentials ---
-ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
-NVD_API_KEY = os.getenv("NVD_API_KEY", "")  # optional
+ABUSEIPDB_API_KEY  = os.getenv("ABUSEIPDB_API_KEY", "")
+NVD_API_KEY        = os.getenv("NVD_API_KEY", "")        # optional
+GREYNOISE_API_KEY  = os.getenv("GREYNOISE_API_KEY", "")  # optional — community tier works without it
 
 # --- API endpoints ---
-NVD_CVE_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-ABUSEIPDB_BLACKLIST_URL = "https://api.abuseipdb.com/api/v2/blacklist"
+NVD_CVE_API_URL            = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+ABUSEIPDB_BLACKLIST_URL    = "https://api.abuseipdb.com/api/v2/blacklist"
+GREYNOISE_COMMUNITY_URL    = "https://api.greynoise.io/v3/community/{ip}"  # Phase 7
 
 # --- Collection parameters ---
 NVD_RESULTS_PER_PAGE = 200          # NVD max page size
@@ -34,8 +36,9 @@ ABUSEIPDB_LIMIT = 500               # max IPs to request from the blacklist endp
 # --- Source reliability weights (manually assigned, documented in the report) ---
 # Used as a feature: reflects how much we trust each source's own scoring.
 SOURCE_RELIABILITY = {
-    "nvd": 0.9,          # NIST-maintained, authoritative for CVE severity
-    "abuseipdb": 0.6,    # community-reported, more prone to false positives
+    "nvd":        0.9,   # NIST-maintained, authoritative for CVE severity
+    "abuseipdb":  0.6,   # community-reported, more prone to false positives
+    "greynoise":  0.7,   # Phase 7: noise/intent classification, good complementary signal
 }
 
 # --- Priority label buckets (used by labeling.py) ---

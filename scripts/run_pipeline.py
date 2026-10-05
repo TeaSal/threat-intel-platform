@@ -38,8 +38,26 @@ def collect_synthetic(n_cves=300, n_ips=300):
 def collect_live():
     from src.collectors.nvd_collector import fetch_recent_cves
     from src.collectors.abuseipdb_collector import fetch_malicious_ips
+    from src.collectors.greynoise_collector import fetch_greynoise_context
+    from src.config import GREYNOISE_API_KEY
+
     print("[collect] fetching real data from NVD + AbuseIPDB (requires internet + API keys)...")
-    return fetch_recent_cves(), fetch_malicious_ips()
+    raw_nvd       = fetch_recent_cves()
+    raw_abuseipdb = fetch_malicious_ips()
+
+    # Phase 7: enrich AbuseIPDB IPs with GreyNoise context (community tier, no key needed)
+    # Build the IP list from the AbuseIPDB records already fetched
+    ip_list = [r["ipAddress"] for r in raw_abuseipdb if r.get("ipAddress")]
+    if ip_list:
+        key_note = "with API key" if GREYNOISE_API_KEY else "community tier, no key"
+        print(f"[collect] querying GreyNoise for {len(ip_list)} IPs ({key_note}, ~1 req/s)...")
+        raw_greynoise = fetch_greynoise_context(ip_list, max_ips=200)
+        print(f"[collect] GreyNoise returned {len(raw_greynoise)} classified records")
+    else:
+        raw_greynoise = []
+        print("[collect] no IPs to query GreyNoise for")
+
+    return raw_nvd, raw_abuseipdb, raw_greynoise
 
 
 def main():
@@ -68,16 +86,20 @@ def main():
             print("[collect] ERROR: --retrain requires existing records in the DB. Run --live first.")
             sys.exit(1)
         print(f"[collect] --retrain: skipping collection, using {total_in_db} existing DB records")
+        raw_nvd = raw_abuseipdb = raw_greynoise = []
     elif args.synthetic:
         raw_nvd, raw_abuseipdb = collect_synthetic(args.n_cves, args.n_ips)
+        raw_greynoise = []   # no synthetic GreyNoise data (per Phase 7 spec)
     else:
-        raw_nvd, raw_abuseipdb = collect_live()
+        raw_nvd, raw_abuseipdb, raw_greynoise = collect_live()
 
     if not args.retrain:
-        print(f"[collect] raw records: {len(raw_nvd)} NVD, {len(raw_abuseipdb)} AbuseIPDB")
+        print(f"[collect] raw records: {len(raw_nvd)} NVD, {len(raw_abuseipdb)} AbuseIPDB"
+              + (f", {len(raw_greynoise)} GreyNoise" if raw_greynoise else ""))
 
         # 2. Normalize
-        normalized = normalize_batch(raw_nvd, raw_abuseipdb)
+        normalized = normalize_batch(raw_nvd, raw_abuseipdb,
+                                     raw_greynoise if raw_greynoise else None)
         print(f"[normalize] {len(normalized)} records mapped to common schema")
 
         # 3. Deduplicate

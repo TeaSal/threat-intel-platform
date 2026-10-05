@@ -90,6 +90,66 @@ def normalize_abuseipdb_record(raw: Dict[str, Any]) -> NormalizedThreat:
     )
 
 
+def normalize_greynoise_record(raw: Dict[str, Any]) -> NormalizedThreat:
+    """
+    Map a raw GreyNoise community API response to NormalizedThreat.
+
+    GreyNoise classifies IPs as 'malicious' | 'benign' | 'unknown'.
+    Only 'malicious' records should normally be passed here (the caller
+    filters on classification), but we handle all values defensively.
+
+    Severity mapping (0–10 scale):
+      malicious → 7.0   (high confidence malicious actor)
+      unknown   → 3.0   (insufficient signal)
+      benign    → 0.5   (listed but not malicious — edge case)
+    """
+    ip            = raw.get("ip") or raw.get("_queried_ip", "unknown")
+    classification= raw.get("classification", "unknown").lower()
+    noise         = bool(raw.get("noise", False))
+    riot          = bool(raw.get("riot", False))   # part of known-good infrastructure list
+    name          = raw.get("name") or "unknown"
+    last_seen     = raw.get("last_seen", "")
+    message       = raw.get("message", "")
+    link          = raw.get("link", "")
+
+    # Convert last_seen date string "YYYY-MM-DD" to ISO datetime if needed
+    if last_seen and len(last_seen) == 10:
+        last_seen = last_seen + "T00:00:00.000"
+
+    SEVERITY_MAP = {"malicious": 7.0, "unknown": 3.0, "benign": 0.5}
+    severity_raw = SEVERITY_MAP.get(classification, 3.0)
+
+    description = (
+        message
+        or f"IP {ip} classified as {classification} by GreyNoise"
+        + (f" (actor: {name})" if name != "unknown" else "")
+        + (" [internet noise]" if noise else "")
+        + (" [RIOT — known-good infrastructure]" if riot else "")
+        + "."
+    )
+
+    return NormalizedThreat(
+        id=ip,
+        threat_type="malicious_ip",
+        title=f"Malicious IP {ip}",
+        description=description[:500],
+        severity_raw=severity_raw,
+        report_count=1,          # GreyNoise community doesn't expose a report count
+        first_seen=last_seen,    # community tier only provides last_seen
+        last_seen=last_seen,
+        source="greynoise",
+        source_reliability=SOURCE_RELIABILITY["greynoise"],
+        exploited_flag=False,    # not a meaningful concept for this source
+        extra={
+            "classification": classification,
+            "noise":          noise,
+            "riot":           riot,
+            "actor_name":     name,
+            "greynoise_link": link,
+        },
+    )
+
+
 def _extract_cwe(cve: Dict[str, Any]) -> str:
     weaknesses = cve.get("weaknesses", [])
     if weaknesses:
@@ -99,7 +159,21 @@ def _extract_cwe(cve: Dict[str, Any]) -> str:
     return "unknown"
 
 
-def normalize_batch(raw_nvd: List[Dict[str, Any]], raw_abuseipdb: List[Dict[str, Any]]) -> List[NormalizedThreat]:
+def normalize_batch(
+    raw_nvd: List[Dict[str, Any]],
+    raw_abuseipdb: List[Dict[str, Any]],
+    raw_greynoise: List[Dict[str, Any]] | None = None,
+) -> List[NormalizedThreat]:
+    """
+    Normalize records from all sources into a single list of NormalizedThreat.
+
+    Parameters
+    ----------
+    raw_nvd        : list of raw NVD v2.0 vulnerability dicts
+    raw_abuseipdb  : list of raw AbuseIPDB blacklist dicts
+    raw_greynoise  : list of raw GreyNoise community dicts (Phase 7, optional)
+                     Only 'malicious' classified IPs are normalized; others skipped.
+    """
     normalized = []
     for r in raw_nvd:
         try:
@@ -111,4 +185,12 @@ def normalize_batch(raw_nvd: List[Dict[str, Any]], raw_abuseipdb: List[Dict[str,
             normalized.append(normalize_abuseipdb_record(r))
         except (KeyError, TypeError, IndexError) as e:
             print(f"[normalize] skipping malformed AbuseIPDB record: {e}")
+    for r in (raw_greynoise or []):
+        try:
+            # Only normalize IPs GreyNoise classifies as malicious
+            if r.get("classification", "").lower() != "malicious":
+                continue
+            normalized.append(normalize_greynoise_record(r))
+        except (KeyError, TypeError, IndexError) as e:
+            print(f"[normalize] skipping malformed GreyNoise record: {e}")
     return normalized
