@@ -294,6 +294,14 @@ if not rows:
 
 df = pd.DataFrame(rows)
 
+# Load analyst feedback and merge analyst_label into main df for the ranked table
+_all_feedback = _fetch_all_feedback()
+if _all_feedback:
+    _fb_df = pd.DataFrame(_all_feedback)[["threat_id", "analyst_label"]]
+    df = df.merge(_fb_df, left_on="id", right_on="threat_id", how="left").drop(columns="threat_id")
+else:
+    df["analyst_label"] = None
+
 # ─────────────────────────────────────────────
 #  Header
 # ─────────────────────────────────────────────
@@ -358,6 +366,12 @@ from src.pipeline.db import (
     fetch_unacknowledged_alert_count as _unack_count,
     update_alert_status as _update_alert_status,
 )
+from src.pipeline.db import (
+    fetch_feedback_for_threat as _fetch_feedback,
+    upsert_analyst_feedback as _upsert_feedback,
+    ANALYST_LABEL_OPTIONS as _ANALYST_LABEL_OPTIONS,
+    fetch_analyst_feedback as _fetch_all_feedback,
+)
 
 _unack = _unack_count()
 _alerts_label = f"🚨 Alerts ({_unack})" if _unack > 0 else "🚨 Alerts"
@@ -416,7 +430,8 @@ with tab_threats:
 
     display_cols = [
         "id", "threat_type", "title", "severity_raw", "predicted_priority",
-        "predicted_priority_score", "heuristic_label", "cluster_id", "source", "last_seen",
+        "predicted_priority_score", "heuristic_label", "analyst_label",
+        "cluster_id", "source", "last_seen",
     ]
     display_cols = [c for c in display_cols if c in page_df.columns]
 
@@ -428,6 +443,7 @@ with tab_threats:
         "predicted_priority": "ML Priority",
         "predicted_priority_score": "ML Rank Score",
         "heuristic_label": "Heuristic Label",
+        "analyst_label": "Analyst Label",
         "cluster_id": "Cluster",
         "source": "Source",
         "last_seen": "Last Seen",
@@ -853,6 +869,102 @@ with tab_threats:
 </div>""",
                     unsafe_allow_html=True,
                 )
+
+    st.divider()
+
+    # ── Phase 9: Analyst Feedback ──────────────────────────────────────────
+    if selected_id:
+        st.markdown("### 🏷️ Analyst Feedback")
+        st.caption(
+            "Validate or correct the ML prediction. Analyst labels are stored separately "
+            "and never overwrite the heuristic or ML labels. All three labels are shown "
+            "side-by-side so discrepancies are immediately visible."
+        )
+
+        _record = filtered[filtered["id"] == selected_id].iloc[0]
+        _heuristic  = _record.get("heuristic_label",    "—")
+        _ml_pred    = _record.get("predicted_priority",  "—")
+        _existing_fb = _fetch_feedback(selected_id)
+        _current_analyst_label = _existing_fb["analyst_label"] if _existing_fb else None
+
+        LABEL_COLORS = {
+            "Critical":           "#fda4af", "High":     "#fdba74",
+            "Medium":             "#fde68a", "Low":      "#86efac",
+            "Confirmed_Critical": "#fda4af", "Confirmed_High":   "#fdba74",
+            "Confirmed_Medium":   "#fde68a", "Confirmed_Low":    "#86efac",
+            "False_Positive":     "#93c5fd", "Needs_Review":     "#d8b4fe",
+        }
+        LABEL_BG = {
+            "Critical":           "#4c0519", "High":     "#431407",
+            "Medium":             "#3b2509", "Low":      "#052e16",
+            "Confirmed_Critical": "#4c0519", "Confirmed_High":   "#431407",
+            "Confirmed_Medium":   "#3b2509", "Confirmed_Low":    "#052e16",
+            "False_Positive":     "#0c1a4a", "Needs_Review":     "#2e1065",
+        }
+
+        def _label_chip(label, title):
+            fg = LABEL_COLORS.get(str(label) if label else "", "#c4b5fd")
+            bg = LABEL_BG.get(str(label) if label else "", "#1a0a3d")
+            disp = label if label else "—"
+            return (
+                f"<div style='text-align:center;'>"
+                f"<div style='color:#7c5cbf;font-size:0.72rem;font-weight:600;"
+                f"text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px;'>{title}</div>"
+                f"<span style='background:{bg};color:{fg};border:1px solid {fg}44;"
+                f"border-radius:20px;padding:4px 14px;font-size:0.82rem;font-weight:700;'>"
+                f"{disp}</span></div>"
+            )
+
+        chip_cols = st.columns(3)
+        chip_cols[0].markdown(_label_chip(_heuristic,  "Heuristic Label"),         unsafe_allow_html=True)
+        chip_cols[1].markdown(_label_chip(_ml_pred,    "ML Predicted"),            unsafe_allow_html=True)
+        chip_cols[2].markdown(_label_chip(_current_analyst_label, "Analyst Validated"), unsafe_allow_html=True)
+
+        st.markdown("")
+
+        with st.form(key=f"feedback_form_{selected_id}", clear_on_submit=False):
+            fc1, fc2, fc3 = st.columns([2, 3, 1.2])
+            _default_idx = (
+                _ANALYST_LABEL_OPTIONS.index(_current_analyst_label)
+                if _current_analyst_label and _current_analyst_label in _ANALYST_LABEL_OPTIONS
+                else 0
+            )
+            chosen_label = fc1.selectbox(
+                "Analyst Label", options=_ANALYST_LABEL_OPTIONS,
+                index=_default_idx, key=f"al_label_{selected_id}",
+                help="Select your validated priority assessment for this threat.",
+            )
+            chosen_notes = fc2.text_input(
+                "Notes (optional)",
+                value=_existing_fb["feedback_notes"] if _existing_fb and _existing_fb.get("feedback_notes") else "",
+                key=f"al_notes_{selected_id}",
+                placeholder="e.g. Confirmed via internal vuln scan, false positive — internal host",
+            )
+            fc3.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
+            submitted = fc3.form_submit_button("✅ Submit", type="primary")
+            if submitted:
+                _upsert_feedback(
+                    threat_id=selected_id,
+                    analyst_label=chosen_label,
+                    notes=chosen_notes,
+                    analyst_id="analyst_1",
+                )
+                st.success(f"Feedback saved: **{chosen_label}** for `{selected_id[:60]}`")
+                st.rerun()
+
+        if _existing_fb:
+            _ts_upd = str(_existing_fb.get("updated_at", ""))[:19].replace("T", " ")
+            st.markdown(
+                f"<div style='background:#1a0a3d;border:1px solid #4a1d96;"
+                f"border-radius:8px;padding:10px 16px;margin-top:6px;"
+                f"font-size:0.82rem;color:#9f7aea;'>"
+                f"Last updated: <b style='color:#c4b5fd;'>{_ts_upd}</b> "
+                f"by <b style='color:#c4b5fd;'>{_existing_fb.get('analyst_id','—')}</b>"
+                + (f"<br>Notes: <span style='color:#c4b5fd;'>{_existing_fb.get('feedback_notes','')}</span>"
+                   if _existing_fb.get("feedback_notes") else "")
+                + "</div>",
+                unsafe_allow_html=True,
+            )
 
     st.divider()
     st.caption(

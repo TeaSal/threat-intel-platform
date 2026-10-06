@@ -94,6 +94,19 @@ CREATE TABLE IF NOT EXISTS threat_history (
 );
 """
 
+# Phase 9: analyst feedback table — one row per threat, stores validated labels.
+ANALYST_FEEDBACK_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS analyst_feedback (
+    feedback_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    threat_id     TEXT    NOT NULL UNIQUE,
+    analyst_label TEXT    NOT NULL,
+    feedback_notes TEXT,
+    analyst_id    TEXT    NOT NULL DEFAULT 'analyst_1',
+    created_at    TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL
+);
+"""
+
 # Phase 5: alerts table — one row per generated alert, with analyst status tracking.
 ALERTS_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS alerts (
@@ -136,7 +149,8 @@ def init_db():
         conn.execute(MITRE_SCHEMA_SQL)       # Phase 3
         conn.execute(PIPELINE_RUNS_SQL)      # Phase 4
         conn.execute(THREAT_HISTORY_SQL)     # Phase 4
-        conn.execute(ALERTS_SCHEMA_SQL)      # Phase 5
+        conn.execute(ALERTS_SCHEMA_SQL)              # Phase 5
+        conn.execute(ANALYST_FEEDBACK_SCHEMA_SQL)    # Phase 9
         # Safe ALTER TABLE migrations for the threats table.
         existing = {row[1] for row in conn.execute("PRAGMA table_info(threats)").fetchall()}
         for col_name, col_def in _MIGRATION_COLUMNS:
@@ -471,6 +485,81 @@ def update_explanations(id_to_explanation: dict):
                 "UPDATE threats SET explanation_json=? WHERE id=?",
                 (json.dumps(exp), tid),
             )
+
+
+# ── Phase 9: Analyst Feedback ─────────────────────────────────────────────────
+
+# Valid analyst label values
+ANALYST_LABEL_OPTIONS = [
+    "Confirmed_Critical",
+    "Confirmed_High",
+    "Confirmed_Medium",
+    "Confirmed_Low",
+    "False_Positive",
+    "Needs_Review",
+]
+
+
+def upsert_analyst_feedback(
+    threat_id:      str,
+    analyst_label:  str,
+    notes:          str = "",
+    analyst_id:     str = "analyst_1",
+) -> None:
+    """
+    Insert or update analyst feedback for a threat.
+    The original heuristic label and ML prediction are NEVER modified here.
+    """
+    assert analyst_label in ANALYST_LABEL_OPTIONS, (
+        f"Invalid analyst_label '{analyst_label}'. "
+        f"Must be one of: {ANALYST_LABEL_OPTIONS}"
+    )
+    init_db()
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT feedback_id, created_at FROM analyst_feedback WHERE threat_id=?",
+            (threat_id,),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE analyst_feedback
+                SET analyst_label=?, feedback_notes=?, analyst_id=?, updated_at=?
+                WHERE threat_id=?
+                """,
+                (analyst_label, notes, analyst_id, now, threat_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO analyst_feedback
+                    (threat_id, analyst_label, feedback_notes, analyst_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (threat_id, analyst_label, notes, analyst_id, now, now),
+            )
+
+
+def fetch_analyst_feedback(limit: int = 2000) -> List[dict]:
+    """Return all analyst feedback rows, newest updated first."""
+    init_db()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM analyst_feedback ORDER BY updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def fetch_feedback_for_threat(threat_id: str) -> Optional[dict]:
+    """Return analyst feedback for a single threat, or None if not submitted."""
+    init_db()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM analyst_feedback WHERE threat_id=?", (threat_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
 
 # ── Phase 5: Alerts ───────────────────────────────────────────────────────────

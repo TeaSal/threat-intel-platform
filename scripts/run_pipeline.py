@@ -68,12 +68,24 @@ def main():
     mode.add_argument("--live", action="store_true", help="Use real live APIs (needs keys + internet)")
     mode.add_argument("--retrain", action="store_true",
                       help="Skip collection; re-label and retrain on existing DB records")
+    mode.add_argument("--retrain-validated", action="store_true",
+                      help="Retrain using analyst-validated labels instead of heuristic labels. "
+                           "Requires analyst feedback submitted via the dashboard. "
+                           "Prints a warning if fewer than 50 validated examples are available.")
     parser.add_argument("--n-cves", type=int, default=300)
     parser.add_argument("--n-ips", type=int, default=300)
     args = parser.parse_args()
 
     pipeline_start = time.time()
-    run_mode = "synthetic" if args.synthetic else "live" if args.live else "retrain"
+    run_mode = (
+        "synthetic"         if args.synthetic         else
+        "live"              if args.live              else
+        "retrain_validated" if args.retrain_validated else
+        "retrain"
+    )
+
+    # Convenience bool used throughout
+    skip_collection = args.retrain or args.retrain_validated
 
     # ── Phase 4: snapshot state BEFORE this run ────────────────────────────
     db.init_db()   # ensure tables exist before snapshot
@@ -81,12 +93,12 @@ def main():
     priorities_before = db.snapshot_priorities()
 
     # 1. Collect
-    if args.retrain:
+    if skip_collection:
         total_in_db = db.count()
         if total_in_db == 0:
-            print("[collect] ERROR: --retrain requires existing records in the DB. Run --live first.")
+            print(f"[collect] ERROR: {run_mode} requires existing records in the DB. Run --live or --synthetic first.")
             sys.exit(1)
-        print(f"[collect] --retrain: skipping collection, using {total_in_db} existing DB records")
+        print(f"[collect] {run_mode}: skipping collection, using {total_in_db} existing DB records")
         raw_nvd = raw_abuseipdb = raw_greynoise = []
     elif args.synthetic:
         raw_nvd, raw_abuseipdb = collect_synthetic(args.n_cves, args.n_ips)
@@ -94,7 +106,7 @@ def main():
     else:
         raw_nvd, raw_abuseipdb, raw_greynoise = collect_live()
 
-    if not args.retrain:
+    if not skip_collection:
         print(f"[collect] raw records: {len(raw_nvd)} NVD, {len(raw_abuseipdb)} AbuseIPDB"
               + (f", {len(raw_greynoise)} GreyNoise" if raw_greynoise else ""))
 
@@ -122,6 +134,55 @@ def main():
     print("[labeling] heuristic label distribution:")
     print(labeled["heuristic_label"].value_counts().to_string())
     db.update_heuristic_labels(dict(zip(labeled["id"], labeled["heuristic_label"])))
+
+    # Phase 9: --retrain-validated — substitute analyst labels where available
+    if args.retrain_validated:
+        feedback_rows = db.fetch_analyst_feedback()
+        if not feedback_rows:
+            print("[retrain-validated] WARNING: no analyst feedback found in DB. "
+                  "Submit labels via the dashboard first. Falling back to heuristic labels.")
+        else:
+            # Map analyst labels to heuristic-style bucket labels
+            ANALYST_TO_BUCKET = {
+                "Confirmed_Critical": "Critical",
+                "Confirmed_High":     "High",
+                "Confirmed_Medium":   "Medium",
+                "Confirmed_Low":      "Low",
+                "False_Positive":     "Low",    # treat FP as lowest priority for training
+                "Needs_Review":       None,     # exclude from training — label is ambiguous
+            }
+            fb_map = {
+                r["threat_id"]: ANALYST_TO_BUCKET.get(r["analyst_label"])
+                for r in feedback_rows
+            }
+            # Apply overrides; exclude Needs_Review rows from training
+            valid_overrides = {tid: lbl for tid, lbl in fb_map.items() if lbl is not None}
+            n_validated = len(valid_overrides)
+            n_excluded  = sum(1 for lbl in fb_map.values() if lbl is None)
+            if n_validated < 50:
+                print(
+                    f"[retrain-validated] WARNING: only {n_validated} validated examples "
+                    f"available (< 50 recommended for reliable training). "
+                    f"Results may be unreliable. Consider labelling more threats first."
+                )
+            else:
+                print(f"[retrain-validated] using {n_validated} analyst-validated labels "
+                      f"({n_excluded} Needs_Review excluded).")
+
+            # Override heuristic_label in the labeled DataFrame where analyst label exists
+            labeled["heuristic_label"] = labeled.apply(
+                lambda r: valid_overrides.get(r["id"], r["heuristic_label"]),
+                axis=1,
+            )
+            # Drop rows where analyst said Needs_Review (ambiguous — don't train on them)
+            needs_review_ids = {tid for tid, lbl in fb_map.items() if lbl is None}
+            if needs_review_ids:
+                before = len(labeled)
+                labeled = labeled[~labeled["id"].isin(needs_review_ids)].reset_index(drop=True)
+                print(f"[retrain-validated] dropped {before - len(labeled)} Needs_Review rows from training set.")
+
+            print("[retrain-validated] final label distribution:")
+            print(labeled["heuristic_label"].value_counts().to_string())
 
     # 7. Train models
     print("[train] training Logistic Regression, Decision Tree, Random Forest...")
