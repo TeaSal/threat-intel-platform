@@ -26,3 +26,6 @@ reports/*.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Phase 10: org context — contains asset inventory, never commit
+org_context.json

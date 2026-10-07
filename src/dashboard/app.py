@@ -376,12 +376,13 @@ from src.pipeline.db import (
 _unack = _unack_count()
 _alerts_label = f"🚨 Alerts ({_unack})" if _unack > 0 else "🚨 Alerts"
 
-tab_threats, tab_clusters, tab_mitre, tab_monitor, tab_alerts, tab_models = st.tabs([
+tab_threats, tab_clusters, tab_mitre, tab_monitor, tab_alerts, tab_settings, tab_models = st.tabs([
     "🔒 Threats",
     "🔗 Clusters",
     "🧩 MITRE ATT&CK",
     "📡 Monitoring",
     _alerts_label,
+    "⚙️ Settings",
     "🤖 Model Evaluation",
 ])
 
@@ -430,7 +431,7 @@ with tab_threats:
 
     display_cols = [
         "id", "threat_type", "title", "severity_raw", "predicted_priority",
-        "predicted_priority_score", "heuristic_label", "analyst_label",
+        "predicted_priority_score", "context_adjusted_score", "heuristic_label", "analyst_label",
         "cluster_id", "source", "last_seen",
     ]
     display_cols = [c for c in display_cols if c in page_df.columns]
@@ -442,6 +443,7 @@ with tab_threats:
         "severity_raw": "Severity",
         "predicted_priority": "ML Priority",
         "predicted_priority_score": "ML Rank Score",
+        "context_adjusted_score": "Ctx Score",
         "heuristic_label": "Heuristic Label",
         "analyst_label": "Analyst Label",
         "cluster_id": "Cluster",
@@ -2221,7 +2223,133 @@ Alerts are <b>dashboard-only</b> — no external emails or webhooks are sent.
 
 
 # ══════════════════════════════════════════════
-#  TAB 6 — MODEL EVALUATION  (original content)
+#  TAB 6 — SETTINGS / ORG CONTEXT  (Phase 10)
+# ══════════════════════════════════════════════
+with tab_settings:
+    from src.config_org import load_org_context, save_org_context, org_context_configured
+    from src.pipeline.context_scorer import apply_context_score
+
+    st.markdown("### ⚙️ Settings — Organisational Context")
+    st.markdown("""
+<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:10px;
+            padding:14px 18px;margin-bottom:16px;font-size:0.88rem;color:#c4b5fd;'>
+<b style='color:#a855f7'>What is Organisational Context?</b><br>
+Configure your organisation's asset environment so threat priority can be
+contextualised against what actually matters to you. The platform will apply
+small score boosts to threats that match your high-value assets or exposure profile.
+<br><br>
+<b>Important:</b> This produces a <em>context-adjusted score</em> for display only.
+It never overwrites the ML prediction or retrains the model.
+The org context is stored in <code>org_context.json</code> (not committed to git).
+After saving, re-run the pipeline to apply context scores:
+<code>python scripts/run_pipeline.py --retrain</code>
+</div>
+""", unsafe_allow_html=True)
+
+    current_ctx = load_org_context()
+    configured  = org_context_configured()
+
+    if configured:
+        st.success(f"Org context configured for: **{current_ctx.get('org_name', 'unnamed')}**")
+    else:
+        st.info("No org context configured yet. Fill in the form below and click Save.")
+
+    st.markdown("#### Organisation Profile")
+
+    with st.form("org_context_form"):
+        org_name = st.text_input(
+            "Organisation name",
+            value=current_ctx.get("org_name", ""),
+            placeholder="e.g. Acme Corp",
+        )
+        high_value_raw = st.text_input(
+            "High-value asset keywords (comma-separated)",
+            value=", ".join(current_ctx.get("high_value_assets", [])),
+            placeholder="e.g. Apache, Microsoft, OpenSSL, Cisco",
+            help="CVEs mentioning these vendors/products will receive a score boost.",
+        )
+        internet_exposed = st.checkbox(
+            "Internet-exposed environment",
+            value=bool(current_ctx.get("internet_exposed", False)),
+            help="Tick if your systems are directly reachable from the internet. "
+                 "High/Critical threats receive an additional boost.",
+        )
+        criticality_options = ["low", "medium", "high", "critical"]
+        criticality = st.selectbox(
+            "Organisation criticality",
+            options=criticality_options,
+            index=criticality_options.index(
+                current_ctx.get("criticality", "medium")
+            ),
+            help="How critical is your organisation? Higher criticality applies a "
+                 "global score boost to all threats.",
+        )
+        ignored_sources_raw = st.text_input(
+            "Ignored sources (comma-separated, leave blank for none)",
+            value=", ".join(current_ctx.get("ignored_sources", [])),
+            placeholder="e.g. greynoise",
+            help="Threats from these sources will be suppressed (context score = 0).",
+        )
+
+        saved = st.form_submit_button("💾 Save Configuration")
+
+    if saved:
+        new_ctx = {
+            "org_name":          org_name.strip(),
+            "high_value_assets": [a.strip() for a in high_value_raw.split(",") if a.strip()],
+            "internet_exposed":  internet_exposed,
+            "criticality":       criticality,
+            "ignored_sources":   [s.strip() for s in ignored_sources_raw.split(",") if s.strip()],
+        }
+        save_org_context(new_ctx)
+        st.success(
+            "Configuration saved to `org_context.json`. "
+            "Re-run the pipeline (`--retrain`) to apply context scores to all threats."
+        )
+        st.rerun()
+
+    # ── Context score preview ──────────────────────────────────────────────
+    if configured and not saved:
+        st.divider()
+        st.markdown("#### Live Context Score Preview")
+        st.caption(
+            "Shows how the current configuration adjusts scores for a sample of threats. "
+            "Context-adjusted scores are for analyst guidance only — they do not change "
+            "ML predictions or retraining labels."
+        )
+
+        preview_rows = df.head(20).to_dict(orient="records")
+        ctx = load_org_context()
+        preview_data = []
+        for row in preview_rows:
+            adj_score, reasons = apply_context_score(row, ctx)
+            base = round(float(row.get("predicted_priority_score") or 0), 4)
+            adj  = round(adj_score, 4) if adj_score is not None else base
+            diff = round(adj - base, 4) if adj_score is not None else 0
+            preview_data.append({
+                "ID":             str(row.get("id", ""))[:35],
+                "ML Priority":    row.get("predicted_priority", "—"),
+                "Base Score":     base,
+                "Context Score":  adj,
+                "Boost":          f"+{diff:.4f}" if diff > 0 else str(diff),
+                "Reason":         reasons[0] if reasons else "—",
+            })
+        st.dataframe(pd.DataFrame(preview_data), use_container_width=True, hide_index=True)
+
+        # Context score column in the main threats df (if column exists)
+        if "context_adjusted_score" in df.columns and df["context_adjusted_score"].notna().any():
+            st.divider()
+            n_boosted = int((df["context_adjusted_score"].fillna(0) >
+                             df["predicted_priority_score"].fillna(0)).sum())
+            n_suppressed = int((df["context_adjusted_score"] == 0).sum())
+            cb1, cb2, cb3 = st.columns(3)
+            cb1.metric("Threats with context score", int(df["context_adjusted_score"].notna().sum()))
+            cb2.metric("Received boost",             n_boosted)
+            cb3.metric("Suppressed (ignored source)", n_suppressed)
+
+
+# ══════════════════════════════════════════════
+#  TAB 7 — MODEL EVALUATION  (original content)
 # ══════════════════════════════════════════════
 with tab_models:
     metrics_path = REPORTS_DIR / "metrics.json"
@@ -2237,6 +2365,63 @@ with tab_models:
                 f"{m['accuracy'] * 100:.1f}%",
                 help="Accuracy on held-out test set",
             )
+
+        # ── Phase 11: Per-class F1 scores ─────────────────────────────────
+        per_class_path = REPORTS_DIR / "per_class_metrics.json"
+        f1_chart_path  = REPORTS_DIR / "per_class_f1_comparison.png"
+
+        if per_class_path.exists():
+            st.divider()
+            st.markdown("#### Per-Class Precision / Recall / F1")
+            st.caption(
+                "F1 scores reflect how well the model learns the heuristic labels — "
+                "not real-world analyst agreement. Low F1 on Critical/High indicates "
+                "class imbalance impact. Values below 0.50 are flagged."
+            )
+            with open(per_class_path) as f:
+                per_class = json.load(f)
+
+            for model_name, class_data in per_class.items():
+                with st.expander(
+                    f"📈 {model_name.replace('_', ' ').title()} — per-class metrics",
+                    expanded=(model_name == "random_forest"),
+                ):
+                    pc_rows = []
+                    for cls in ["Critical", "High", "Medium", "Low"]:
+                        cd = class_data.get(cls, {})
+                        f1  = cd.get("f1", 0)
+                        flag = "⚠️" if f1 < 0.5 else "✅"
+                        pc_rows.append({
+                            "Class":     cls,
+                            "Precision": cd.get("precision", 0),
+                            "Recall":    cd.get("recall",    0),
+                            "F1-Score":  f1,
+                            "Support":   cd.get("support",   0),
+                            "Status":    flag,
+                        })
+                    pc_df = pd.DataFrame(pc_rows)
+                    st.dataframe(pc_df, use_container_width=True, hide_index=True)
+
+                    # Strategy A vs B note for RF SMOTE
+                    if model_name == "random_forest_smote":
+                        st.markdown(
+                            "<div style='background:#052e16;border:1px solid #166534;"
+                            "border-radius:8px;padding:10px 14px;color:#86efac;"
+                            "font-size:0.85rem;'>"
+                            "⚗️ <b>Strategy B (SMOTE)</b> — trained with synthetic minority "
+                            "oversampling. Compare Critical/High F1 with the baseline "
+                            "Random Forest to assess whether SMOTE improves minority-class "
+                            "detection on these heuristic labels."
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
+
+        if f1_chart_path.exists():
+            st.divider()
+            st.markdown("#### F1 Comparison Chart")
+            st.image(str(f1_chart_path), caption="Per-class F1 across all models (Phase 11)")
+
+        st.divider()
 
         for name in metrics:
             cm_path = REPORTS_DIR / f"confusion_matrix_{name}.png"

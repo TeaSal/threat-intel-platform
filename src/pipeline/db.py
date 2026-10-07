@@ -125,9 +125,10 @@ CREATE TABLE IF NOT EXISTS alerts (
 # init_db() applies these as safe ALTER TABLE migrations on existing databases so
 # we never destroy existing data.
 _MIGRATION_COLUMNS = [
-    ("cluster_id",       "INTEGER"),
-    ("ai_summary",       "TEXT"),      # Phase 2: template-based analyst summary
-    ("explanation_json", "TEXT"),      # Phase 8: ML feature-contribution explanation
+    ("cluster_id",              "INTEGER"),
+    ("ai_summary",              "TEXT"),      # Phase 2: template-based analyst summary
+    ("explanation_json",        "TEXT"),      # Phase 8: ML feature-contribution explanation
+    ("context_adjusted_score",  "REAL"),      # Phase 10: org-context boosted score (display only)
 ]
 
 
@@ -641,6 +642,22 @@ def update_alert_status(alert_id: int, status: str):
         conn.execute(
             "UPDATE alerts SET status=? WHERE alert_id=?", (status, alert_id)
         )
+
+
+# ── Phase 10: Organisational Context ──────────────────────────────────────────
+
+def update_context_scores(id_to_context: dict):
+    """
+    id_to_context: {threat_id: adjusted_score_float_or_None}
+    Stores the context-adjusted score for display.
+    Does NOT touch predicted_priority or predicted_priority_score.
+    """
+    with get_connection() as conn:
+        for tid, score in id_to_context.items():
+            conn.execute(
+                "UPDATE threats SET context_adjusted_score=? WHERE id=?",
+                (float(score) if score is not None else None, tid),
+            )
 
 
 if __name__ == "__main__":

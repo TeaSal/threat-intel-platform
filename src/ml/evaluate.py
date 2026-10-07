@@ -2,6 +2,11 @@
 Evaluates trained models: accuracy, precision/recall/F1 per class, confusion
 matrices, and feature importance (for tree-based models). Saves everything to
 reports/ so it can be dropped straight into slides.
+
+Phase 11: evaluate_all() now also produces a per-class F1 comparison table
+and saves it to reports/per_class_metrics.json. If the SMOTE model
+(random_forest_smote) is present, it is evaluated alongside the baseline so
+the analyst can compare Strategy A vs Strategy B on minority-class detection.
 """
 import json
 import numpy as np
@@ -72,6 +77,58 @@ def save_feature_importance(name: str, model):
     return dict(zip(FEATURE_COLS, importances.tolist()))
 
 
+def save_per_class_f1_chart(all_metrics: dict):
+    """
+    Phase 11: Save a grouped bar chart comparing per-class F1 scores across
+    all evaluated models. Highlights Critical and High classes (minority classes)
+    in a distinct colour so class-imbalance impact is immediately visible.
+    """
+    labels_of_interest = PRIORITY_LABELS   # Low, Medium, High, Critical
+    model_names = list(all_metrics.keys())
+    x = np.arange(len(labels_of_interest))
+    width = 0.8 / max(len(model_names), 1)
+
+    # Colour per class: minority (High/Critical) get warm colours
+    class_colors = {
+        "Low":      "#6d28d9",
+        "Medium":   "#2563eb",
+        "High":     "#f97316",
+        "Critical": "#ef4444",
+    }
+
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    fig.patch.set_facecolor("#0d0d1a")
+    ax.set_facecolor("#130d2e")
+
+    for i, model_name in enumerate(model_names):
+        cr = all_metrics[model_name].get("classification_report", {})
+        f1_scores = [cr.get(lbl, {}).get("f1-score", 0) for lbl in labels_of_interest]
+        offset = (i - len(model_names) / 2 + 0.5) * width
+        bars = ax.bar(
+            x + offset, f1_scores, width=width * 0.9,
+            label=model_name.replace("_", " ").title(),
+            edgecolor="#1a0a3d", linewidth=0.5,
+        )
+
+    # F1 = 0.5 warning line
+    ax.axhline(0.5, color="#f87171", linewidth=1, linestyle="--", alpha=0.6,
+               label="F1 = 0.5 (warning threshold)")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels_of_interest, color="#c4b5fd", fontsize=10)
+    ax.set_ylabel("F1-Score", color="#a78bfa", fontsize=9)
+    ax.set_ylim(0, 1.1)
+    ax.set_title("Per-Class F1 Score Comparison (All Models)", color="#c084fc",
+                 fontsize=11, fontweight="bold")
+    ax.tick_params(colors="#c4b5fd", labelsize=8)
+    ax.spines[:].set_color("#4a1d96")
+    ax.legend(facecolor="#1a0a3d", edgecolor="#4a1d96",
+              labelcolor="#c4b5fd", fontsize=8)
+    plt.tight_layout()
+    fig.savefig(REPORTS_DIR / "per_class_f1_comparison.png", dpi=150)
+    plt.close(fig)
+
+
 def evaluate_all(results: dict) -> dict:
     all_metrics = {}
     for name, r in results.items():
@@ -82,8 +139,50 @@ def evaluate_all(results: dict) -> dict:
         all_metrics[name] = metrics
         print(f"[{name}] accuracy={metrics['accuracy']:.3f}")
 
+        # Phase 11: print per-class F1 for minority classes
+        cr = metrics.get("classification_report", {})
+        for cls in ("Critical", "High"):
+            if cls in cr:
+                f1  = cr[cls].get("f1-score", 0)
+                sup = int(cr[cls].get("support", 0))
+                flag = "  ⚠ LOW" if f1 < 0.5 else ""
+                print(f"  [{name}] {cls} F1={f1:.3f}  support={sup}{flag}")
+
+    # Phase 11: save per-class F1 comparison chart
+    save_per_class_f1_chart(all_metrics)
+
+    # Phase 11: SMOTE comparison summary if both strategies present
+    if "random_forest" in all_metrics and "random_forest_smote" in all_metrics:
+        print("\n[Phase 11] Strategy A vs Strategy B (SMOTE) comparison:")
+        for cls in ("Critical", "High", "Medium", "Low"):
+            cr_a = all_metrics["random_forest"].get("classification_report", {}).get(cls, {})
+            cr_b = all_metrics["random_forest_smote"].get("classification_report", {}).get(cls, {})
+            f1_a = cr_a.get("f1-score", 0)
+            f1_b = cr_b.get("f1-score", 0)
+            delta = f1_b - f1_a
+            direction = "↑ SMOTE better" if delta > 0.01 else ("↓ SMOTE worse" if delta < -0.01 else "≈ similar")
+            print(f"  {cls:10}: A={f1_a:.3f}  B={f1_b:.3f}  Δ={delta:+.3f}  {direction}")
+        print("  Note: improvements on heuristic labels reflect label-learning quality,")
+        print("  not real-world analyst agreement. Interpret cautiously.")
+
     with open(REPORTS_DIR / "metrics.json", "w") as f:
         json.dump(all_metrics, f, indent=2)
+
+    # Phase 11: save per-class metrics separately for dashboard
+    per_class = {}
+    for model_name, m in all_metrics.items():
+        cr = m.get("classification_report", {})
+        per_class[model_name] = {
+            cls: {
+                "precision": round(cr.get(cls, {}).get("precision", 0), 3),
+                "recall":    round(cr.get(cls, {}).get("recall",    0), 3),
+                "f1":        round(cr.get(cls, {}).get("f1-score",  0), 3),
+                "support":   int(cr.get(cls,  {}).get("support",    0)),
+            }
+            for cls in PRIORITY_LABELS
+        }
+    with open(REPORTS_DIR / "per_class_metrics.json", "w") as f:
+        json.dump(per_class, f, indent=2)
 
     return all_metrics
 

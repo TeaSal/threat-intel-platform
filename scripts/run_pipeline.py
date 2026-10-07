@@ -25,6 +25,8 @@ from src.pipeline.summarizer import generate_all_summaries
 from src.pipeline.mitre_mapper import map_all_threats
 from src.pipeline.alerting import generate_alerts
 from src.pipeline.explainer import explain_all
+from src.pipeline.context_scorer import score_all_threats
+from src.config_org import load_org_context, org_context_configured
 from src.ml.train import train_all_models
 from src.ml.evaluate import evaluate_all
 
@@ -325,6 +327,25 @@ def main():
     id_to_explanation = explain_all(explain_rows, best_model, feature_cols)
     db.update_explanations(id_to_explanation)
     print(f"[explain] wrote explanations for {len(id_to_explanation)} threats")
+
+    # 16. Organisational context scoring (Phase 10)
+    org_ctx = load_org_context()
+    if org_context_configured():
+        print(f"[context] applying org context for '{org_ctx.get('org_name', 'unnamed org')}'...")
+        ctx_results = score_all_threats(explain_rows, org_ctx)
+        id_to_ctx_score = {tid: score for tid, (score, _) in ctx_results.items()}
+        db.update_context_scores(id_to_ctx_score)
+        boosted = sum(
+            1 for tid, (score, reasons) in ctx_results.items()
+            if score is not None and score > (
+                next((r["predicted_priority_score"] for r in explain_rows if r["id"] == tid), 0) or 0
+            )
+        )
+        print(f"[context] context scores written for {len(id_to_ctx_score)} threats "
+              f"({boosted} received a context boost)")
+    else:
+        print("[context] no org_context.json configured — skipping context scoring. "
+              "Configure via the Settings tab in the dashboard.")
 
     print("\nPipeline complete. Run `streamlit run src/dashboard/app.py` to view the dashboard.")
 
