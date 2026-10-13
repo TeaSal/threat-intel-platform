@@ -1,303 +1,309 @@
 """
-Analyst-facing dashboard. Run with:
-    streamlit run src/dashboard/app.py
-
-Reads directly from data/threat_intel.db (the single source of truth also used
-by training/evaluation), so it always reflects the latest pipeline run.
-
-Post-Review-2 additions:
-  - Tab layout: Threats | Clusters | Model Evaluation
-  - Clusters tab: summary table, bar chart, notable-cluster alerts, member drill-down
+Threat Intelligence Dashboard — Botanical Editorial Design
+Run with: streamlit run src/dashboard/app.py
 """
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-import json
+import sys, json, re
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import streamlit as st
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from src.pipeline import db
 from src.pipeline.db import (
-    fetch_analyst_feedback as _fetch_all_feedback,
+    fetch_analyst_feedback   as _fetch_all_feedback,
+    fetch_alerts             as _fetch_alerts,
+    fetch_unacknowledged_alert_count as _unack_count,
+    update_alert_status      as _update_alert_status,
+    fetch_feedback_for_threat as _fetch_feedback,
+    upsert_analyst_feedback  as _upsert_feedback,
+    ANALYST_LABEL_OPTIONS    as _ANALYST_LABEL_OPTIONS,
+    fetch_pipeline_runs,
+    fetch_threat_history,
+    fetch_all_mitre_mappings,
+    fetch_mitre_for_threat,
 )
 from src.config import REPORTS_DIR
 
-# ─────────────────────────────────────────────
-#  Page config
-# ─────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Threat Intel Dashboard",
+    page_title="ThreatIntel Platform",
+    page_icon="🌿",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# ─────────────────────────────────────────────
-#  Global CSS — purple theme, vibrant fonts, styled tables
-# ─────────────────────────────────────────────
+# ── Design System CSS — Botanical Editorial ───────────────────────────────────
 st.markdown("""
 <style>
-/* ── Import font ── */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;1,9..144,400&family=Inter:wght@400;500;600&display=swap');
 
-/* ── Base overrides ── */
-html, body, [class*="css"] {
+/* ── Reset & base ── */
+html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
+
+/* ── Canvas ── */
+.stApp { background: #eef2e3 !important; color: #043f2e !important; }
+.main .block-container { padding: 2rem 2.5rem 3rem !important; max-width: 1200px; margin: 0 auto; }
+
+/* ── Hide Streamlit chrome ── */
+#MainMenu, footer, header { visibility: hidden; }
+[data-testid="collapsedControl"] { display: none; }
+
+/* ── Headings — Fraunces serif ── */
+h1, h2, h3 {
+    font-family: 'Fraunces', Georgia, serif !important;
+    color: #043f2e !important;
+    font-weight: 400 !important;
+    letter-spacing: -0.03em !important;
+}
+h1 { font-size: 2.8rem !important; line-height: 1.0 !important; margin-bottom: 0.25rem !important; }
+h2 { font-size: 2rem !important; line-height: 1.1 !important; }
+h3 { font-size: 1.4rem !important; line-height: 1.15 !important; }
+
+/* ── Eyebrow labels ── */
+.eyebrow {
+    font-family: 'Inter', sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #043f2e;
+    margin-bottom: 6px;
+    display: block;
+}
+
+/* ── Tabs ── */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0 !important;
+    background: #fcfcfc !important;
+    border-bottom: 1.5px solid #000 !important;
+    padding: 0 !important;
+}
+.stTabs [data-baseweb="tab"] {
+    background: transparent !important;
+    border: none !important;
+    border-bottom: 2px solid transparent !important;
+    border-radius: 0 !important;
+    color: #242423 !important;
     font-family: 'Inter', sans-serif !important;
+    font-weight: 500 !important;
+    font-size: 0.85rem !important;
+    padding: 10px 20px !important;
+    transition: all 0.15s !important;
+    margin-bottom: -1.5px !important;
+}
+.stTabs [data-baseweb="tab"]:hover { color: #043f2e !important; }
+.stTabs [aria-selected="true"] {
+    color: #043f2e !important;
+    font-weight: 600 !important;
+    border-bottom: 2.5px solid #c8f169 !important;
+    background: transparent !important;
 }
 
-/* ── Main background ── */
-.stApp {
-    background: linear-gradient(135deg, #0d0d1a 0%, #130d2e 50%, #0d0d1a 100%);
-    color: #e8e0ff;
-}
-
-/* ── Sidebar ── */
-section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #1a0d3d 0%, #120929 100%);
-    border-right: 1px solid #4a1d96;
-}
-section[data-testid="stSidebar"] * {
-    color: #d4c5f9 !important;
-}
-section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] {
-    background-color: #6d28d9 !important;
-}
-
-/* ── Title ── */
-h1 {
-    background: linear-gradient(90deg, #a855f7, #7c3aed, #c084fc);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    font-size: 2.4rem !important;
-    font-weight: 800 !important;
-    letter-spacing: -0.5px;
-    margin-bottom: 0 !important;
-}
-
-/* ── Subheaders ── */
-h2, h3 {
-    color: #c084fc !important;
-    font-weight: 700 !important;
-    letter-spacing: -0.3px;
-}
-
-/* ── Metric cards ── */
+/* ── KPI stat cards ── */
 [data-testid="stMetric"] {
-    background: linear-gradient(135deg, #1e0a4a 0%, #2d1066 100%);
-    border: 1px solid #6d28d9;
-    border-radius: 14px;
-    padding: 18px 20px !important;
-    box-shadow: 0 4px 24px rgba(109, 40, 217, 0.25);
-    transition: transform 0.2s, box-shadow 0.2s;
-}
-[data-testid="stMetric"]:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 8px 32px rgba(168, 85, 247, 0.35);
+    background: #043f2e !important;
+    border-radius: 16px !important;
+    padding: 20px 22px !important;
+    border: none !important;
+    box-shadow: none !important;
 }
 [data-testid="stMetricLabel"] {
-    color: #a78bfa !important;
-    font-size: 0.8rem !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 10px !important;
     font-weight: 600 !important;
-    text-transform: uppercase;
-    letter-spacing: 1px;
+    letter-spacing: 0.08em !important;
+    text-transform: uppercase !important;
+    color: #c8f169 !important;
 }
 [data-testid="stMetricValue"] {
-    color: #f5f0ff !important;
-    font-size: 2rem !important;
-    font-weight: 800 !important;
-}
-
-/* ── Dataframe / table ── */
-[data-testid="stDataFrame"] {
-    border: 1px solid #4a1d96 !important;
-    border-radius: 12px !important;
-    overflow: hidden;
-}
-[data-testid="stDataFrame"] table {
-    font-size: 0.92rem !important;
     font-family: 'Inter', sans-serif !important;
+    font-size: 2rem !important;
+    font-weight: 400 !important;
+    color: #fcfcfc !important;
+    letter-spacing: -0.02em !important;
 }
-[data-testid="stDataFrame"] thead tr th {
-    background: #3b0764 !important;
-    color: #e9d5ff !important;
-    font-weight: 700 !important;
-    font-size: 0.82rem !important;
-    text-transform: uppercase;
-    letter-spacing: 0.8px;
-    padding: 12px 16px !important;
-    border-bottom: 2px solid #7c3aed !important;
-}
-[data-testid="stDataFrame"] tbody tr {
-    border-bottom: 1px solid #2d1a4e !important;
-}
-[data-testid="stDataFrame"] tbody tr:hover {
-    background: #1e0a4a !important;
-}
-[data-testid="stDataFrame"] tbody tr td {
-    color: #ddd6fe !important;
-    padding: 11px 16px !important;
-}
-
-/* ── Divider ── */
-hr {
-    border-color: #4a1d96 !important;
-    opacity: 0.4;
-}
+[data-testid="stMetricDelta"] { color: #c8f169 !important; }
 
 /* ── Buttons ── */
 .stButton > button {
-    background: linear-gradient(135deg, #6d28d9, #7c3aed);
-    color: white !important;
-    border: none;
-    border-radius: 8px;
-    font-weight: 600;
-    font-size: 0.88rem;
-    padding: 6px 18px;
-    transition: all 0.2s;
-    box-shadow: 0 2px 10px rgba(109, 40, 217, 0.4);
+    background: #c8f169 !important;
+    color: #000 !important;
+    border: none !important;
+    border-radius: 4px !important;
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 500 !important;
+    font-size: 0.85rem !important;
+    padding: 7px 18px !important;
+    transition: background 0.15s !important;
+    box-shadow: none !important;
 }
-.stButton > button:hover {
-    background: linear-gradient(135deg, #7c3aed, #9333ea);
-    box-shadow: 0 4px 16px rgba(147, 51, 234, 0.5);
-    transform: translateY(-1px);
-}
+.stButton > button:hover { background: #2a6f2b !important; color: #fcfcfc !important; }
 .stButton > button:disabled {
-    background: #2d1a4e !important;
-    color: #6b5b9e !important;
-    box-shadow: none;
-    transform: none;
+    background: #d4d9c8 !important;
+    color: #777 !important;
+}
+/* Ghost button variant via class */
+.ghost-btn > button {
+    background: transparent !important;
+    color: #043f2e !important;
+    border: 1px solid #000 !important;
+}
+.ghost-btn > button:hover { background: #043f2e !important; color: #fcfcfc !important; }
+
+/* ── Cards ── */
+.card {
+    background: #fcfcfc;
+    border-radius: 16px;
+    padding: 20px 24px;
+    margin-bottom: 12px;
+}
+.card-sage {
+    background: #eef2e3;
+    border-radius: 16px;
+    padding: 20px 24px;
+    margin-bottom: 12px;
+}
+.card-forest {
+    background: #043f2e;
+    border-radius: 16px;
+    padding: 20px 24px;
+    margin-bottom: 12px;
+    color: #fcfcfc;
 }
 
-/* ── Pagination row ── */
-.pagination-container {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    padding: 12px 0;
-    flex-wrap: wrap;
-}
-.page-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 36px;
-    height: 36px;
-    padding: 0 10px;
-    border-radius: 8px;
-    font-size: 0.85rem;
-    font-weight: 600;
-    cursor: pointer;
-    border: 1px solid #4a1d96;
-    background: #1a0a3d;
-    color: #c4b5fd;
-    transition: all 0.15s;
-}
-.page-btn:hover { background: #3b0764; color: #f3e8ff; }
-.page-btn.active {
-    background: linear-gradient(135deg, #7c3aed, #9333ea);
-    border-color: #a855f7;
-    color: white;
-    box-shadow: 0 2px 12px rgba(168, 85, 247, 0.5);
-}
-.page-btn.disabled { opacity: 0.3; cursor: not-allowed; }
-
-/* ── Priority badges ── */
-.badge {
+/* ── Priority pill badges ── */
+.pill {
     display: inline-block;
-    padding: 3px 10px;
-    border-radius: 20px;
-    font-size: 0.75rem;
-    font-weight: 700;
-    letter-spacing: 0.5px;
+    padding: 2px 10px;
+    border-radius: 9999px;
+    font-family: 'Inter', sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
 }
-.badge-critical { background: #4c0519; color: #fda4af; border: 1px solid #9f1239; }
-.badge-high     { background: #431407; color: #fdba74; border: 1px solid #9a3412; }
-.badge-medium   { background: #3b2509; color: #fde68a; border: 1px solid #92400e; }
-.badge-low      { background: #052e16; color: #86efac; border: 1px solid #166534; }
+.pill-critical { background: #fef2f2; color: #991b1b; border: 1px solid #fca5a5; }
+.pill-high     { background: #fff7ed; color: #9a3412; border: 1px solid #fdba74; }
+.pill-medium   { background: #fefce8; color: #854d0e; border: 1px solid #fde047; }
+.pill-low      { background: #f0fdf4; color: #166534; border: 1px solid #86efac; }
+.pill-chartreuse { background: #c8f169; color: #000; border: none; }
 
-/* ── Select box ── */
-.stSelectbox label, .stMultiSelect label, .stCheckbox label {
-    color: #c4b5fd !important;
-    font-weight: 600 !important;
+/* ── Alert cards ── */
+.alert-critical { border-left: 4px solid #dc2626; background: #fff5f5; border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }
+.alert-high     { border-left: 4px solid #ea580c; background: #fff8f0; border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }
+.alert-warning  { border-left: 4px solid #ca8a04; background: #fffdf0; border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }
+.alert-info     { border-left: 4px solid #043f2e; background: #f0f7f0; border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }
+
+/* ── Threat row cards ── */
+.threat-row {
+    background: #fcfcfc;
+    border-radius: 12px;
+    padding: 14px 18px;
+    margin-bottom: 8px;
+    border: 1px solid #e8edd9;
+    transition: border-color 0.15s;
+}
+.threat-row:hover { border-color: #c8f169; }
+.threat-row-critical { border-left: 4px solid #dc2626 !important; }
+.threat-row-high     { border-left: 4px solid #ea580c !important; }
+.threat-row-medium   { border-left: 4px solid #ca8a04 !important; }
+.threat-row-low      { border-left: 4px solid #16a34a !important; }
+
+/* ── Sidebar ── */
+section[data-testid="stSidebar"] {
+    background: #fcfcfc !important;
+    border-right: 1px solid #e8edd9 !important;
+}
+section[data-testid="stSidebar"] * { color: #043f2e !important; }
+section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] {
+    background: #c8f169 !important;
+    color: #000 !important;
+}
+
+/* ── Inputs ── */
+.stSelectbox > div > div, .stMultiSelect > div > div, .stTextInput > div > div {
+    border-radius: 4px !important;
+    border: 1px solid #000 !important;
+    background: #fcfcfc !important;
+    color: #043f2e !important;
+}
+.stSelectbox label, .stMultiSelect label, .stTextInput label,
+.stCheckbox label, .stRadio label, .stSlider label, .stTextArea label {
+    color: #043f2e !important;
+    font-weight: 500 !important;
     font-size: 0.85rem !important;
 }
 
 /* ── Expander ── */
 details {
-    background: #1a0a3d !important;
-    border: 1px solid #4a1d96 !important;
-    border-radius: 10px !important;
+    background: #fcfcfc !important;
+    border: 1px solid #e8edd9 !important;
+    border-radius: 12px !important;
 }
 summary {
-    color: #c084fc !important;
+    color: #043f2e !important;
     font-weight: 600 !important;
+    font-size: 0.9rem !important;
+    padding: 12px 16px !important;
+}
+summary:hover { background: #eef2e3 !important; }
+
+/* ── Divider ── */
+hr { border-color: #e8edd9 !important; opacity: 1 !important; margin: 24px 0 !important; }
+
+/* ── Dataframe ── */
+[data-testid="stDataFrame"] {
+    border: 1px solid #e8edd9 !important;
+    border-radius: 12px !important;
+}
+[data-testid="stDataFrame"] thead tr th {
+    background: #043f2e !important;
+    color: #fcfcfc !important;
+    font-weight: 600 !important;
+    font-size: 0.78rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
     padding: 10px 14px !important;
 }
+[data-testid="stDataFrame"] tbody tr:hover { background: #eef2e3 !important; }
+[data-testid="stDataFrame"] tbody tr td { color: #242423 !important; padding: 9px 14px !important; }
 
-/* ── Info / warning boxes ── */
-.stAlert {
-    border-radius: 10px !important;
-    border-left: 4px solid #7c3aed !important;
-    background: #1a0a3d !important;
-    color: #e9d5ff !important;
-}
+/* ── Info/warning/success boxes ── */
+.stAlert { border-radius: 8px !important; border-left: 4px solid #c8f169 !important; background: #f6faed !important; color: #043f2e !important; }
 
 /* ── Caption ── */
-.stCaption, small {
-    color: #7c5cbf !important;
-}
+.stCaption, small { color: #6b7c6a !important; font-size: 0.78rem !important; }
 
-/* ── Page info text ── */
-.page-info {
-    color: #9f7aea;
-    font-size: 0.85rem;
-    font-weight: 500;
-    text-align: center;
-    margin: 4px 0 8px;
-}
+/* ── Pagination info ── */
+.page-info { color: #6b7c6a; font-size: 0.82rem; text-align: center; margin: 6px 0; }
 
-/* ── Tabs ── */
-.stTabs [data-baseweb="tab-list"] {
-    gap: 6px;
-    background: transparent !important;
-    border-bottom: 1px solid #4a1d96 !important;
-    padding-bottom: 0 !important;
-}
-.stTabs [data-baseweb="tab"] {
-    background: #1a0a3d !important;
-    border: 1px solid #4a1d96 !important;
-    border-bottom: none !important;
-    border-radius: 8px 8px 0 0 !important;
-    color: #a78bfa !important;
-    font-weight: 600 !important;
-    font-size: 0.88rem !important;
-    padding: 8px 20px !important;
-    transition: all 0.2s !important;
-}
-.stTabs [aria-selected="true"] {
-    background: linear-gradient(135deg, #3b0764, #4c1d96) !important;
-    color: #f3e8ff !important;
-    border-color: #7c3aed !important;
-}
+/* ── Activity dot ── */
+.dot-new      { width:8px;height:8px;border-radius:50%;background:#16a34a;display:inline-block;margin-right:6px; }
+.dot-escalate { width:8px;height:8px;border-radius:50%;background:#dc2626;display:inline-block;margin-right:6px; }
+.dot-reduced  { width:8px;height:8px;border-radius:50%;background:#2563eb;display:inline-block;margin-right:6px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-#  Data load
-# ─────────────────────────────────────────────
+# ── Data loading ──────────────────────────────────────────────────────────────
 rows = db.fetch_all_as_dicts()
 if not rows:
-    st.warning("No data in the database yet. Run `python scripts/run_pipeline.py --synthetic` first.")
+    st.markdown("""
+<div style='background:#fcfcfc;border-radius:16px;padding:48px;text-align:center;margin:60px auto;max-width:500px;border:1px solid #e8edd9;'>
+  <div style='font-family:Fraunces,serif;font-size:2rem;color:#043f2e;margin-bottom:12px;'>No data yet</div>
+  <div style='color:#6b7c6a;margin-bottom:20px;'>Run the pipeline to start collecting threat intelligence.</div>
+  <code style='background:#eef2e3;padding:8px 16px;border-radius:4px;font-size:0.9rem;'>
+    python scripts/run_pipeline.py --synthetic
+  </code>
+</div>""", unsafe_allow_html=True)
     st.stop()
 
 df = pd.DataFrame(rows)
 
-# Load analyst feedback and merge analyst_label into main df for the ranked table
+# Merge analyst feedback
 _all_feedback = _fetch_all_feedback()
 if _all_feedback:
     _fb_df = pd.DataFrame(_all_feedback)[["threat_id", "analyst_label"]]
@@ -305,2143 +311,1122 @@ if _all_feedback:
 else:
     df["analyst_label"] = None
 
-# ─────────────────────────────────────────────
-#  Header
-# ─────────────────────────────────────────────
-st.markdown("# 🛡️ Threat Intelligence Dashboard")
-st.caption("Consolidated CVE + malicious-IP intelligence, ranked by ML-predicted priority.")
+# Pre-compute priority counts
+_prio_counts = df["predicted_priority"].value_counts() if "predicted_priority" in df.columns else {}
+_n_critical  = int(_prio_counts.get("Critical", 0))
+_n_high      = int(_prio_counts.get("High", 0))
+_n_medium    = int(_prio_counts.get("Medium", 0))
+_n_low       = int(_prio_counts.get("Low", 0))
+_n_cves      = int((df["threat_type"] == "cve").sum())
+_n_ips       = int((df["threat_type"] == "malicious_ip").sum())
+_n_exploited = int(df["exploited_flag"].fillna(0).astype(int).sum())
 
-# ─────────────────────────────────────────────
-#  Top summary metrics
-# ─────────────────────────────────────────────
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total Threats", f"{len(df):,}")
-col2.metric("CVEs", f"{int((df['threat_type'] == 'cve').sum()):,}")
-col3.metric("Malicious IPs", f"{int((df['threat_type'] == 'malicious_ip').sum()):,}")
-critical_count = int((df["predicted_priority"] == "Critical").sum()) if "predicted_priority" in df else 0
-col4.metric("Critical Priority", f"{critical_count:,}")
-
-st.divider()
-
-# ─────────────────────────────────────────────
-#  Sidebar filters  (apply to Threats tab only)
-# ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### 🔍 Filters")
-    st.markdown("---")
-
-    type_filter = st.multiselect(
-        "Threat type",
-        options=sorted(df["threat_type"].dropna().unique()),
-        default=list(sorted(df["threat_type"].dropna().unique())),
-    )
-
-    priority_options = ["Critical", "High", "Medium", "Low"]
-    available_priorities = (
-        [p for p in priority_options if p in df["predicted_priority"].values]
-        if "predicted_priority" in df.columns else priority_options
-    )
-    priority_filter = st.multiselect(
-        "Predicted priority",
-        options=priority_options,
-        default=available_priorities or priority_options,
-    )
-
-    sort_desc = st.checkbox("Highest priority first", value=True)
-
-    st.markdown("---")
-    rows_per_page = st.select_slider(
-        "Rows per page", options=[10, 20, 25, 50], value=25
-    )
-
-    st.markdown("---")
-    st.markdown(
-        "<div style='color:#7c5cbf;font-size:0.75rem;'>Data source: NVD + AbuseIPDB<br>"
-        "ML: Logistic Regression · Decision Tree · Random Forest</div>",
-        unsafe_allow_html=True,
-    )
-
-# ─────────────────────────────────────────────
-#  Tab layout
-# ─────────────────────────────────────────────
-from src.pipeline.db import (
-    fetch_alerts as _fetch_alerts,
-    fetch_unacknowledged_alert_count as _unack_count,
-    update_alert_status as _update_alert_status,
-)
-from src.pipeline.db import (
-    fetch_feedback_for_threat as _fetch_feedback,
-    upsert_analyst_feedback as _upsert_feedback,
-    ANALYST_LABEL_OPTIONS as _ANALYST_LABEL_OPTIONS,
-    fetch_analyst_feedback as _fetch_all_feedback,
-)
-
+# Alert counts
 _unack = _unack_count()
-_alerts_label = f"🚨 Alerts ({_unack})" if _unack > 0 else "🚨 Alerts"
+_alerts_label = f"🚨  Alerts  {_unack} new" if _unack > 0 else "🚨  Alerts"
 
-tab_threats, tab_clusters, tab_mitre, tab_monitor, tab_alerts, tab_settings, tab_models = st.tabs([
-    "🔒 Threats",
-    "🔗 Clusters",
-    "🧩 MITRE ATT&CK",
-    "📡 Monitoring",
+# ── Top nav bar ───────────────────────────────────────────────────────────────
+st.markdown(f"""
+<div style='background:#fcfcfc;border-bottom:1px solid #e8edd9;padding:12px 0 10px;
+            margin-bottom:28px;display:flex;align-items:center;gap:32px;'>
+  <span style='font-family:Fraunces,Georgia,serif;font-size:1.15rem;
+               font-weight:400;color:#043f2e;letter-spacing:-0.02em;'>
+    🌿 ThreatIntel
+  </span>
+  {'<span style="background:#c8f169;color:#000;border-radius:9999px;padding:3px 10px;font-size:11px;font-weight:600;">⚠ ' + str(_unack) + ' unread alerts</span>' if _unack > 0 else ''}
+</div>
+""", unsafe_allow_html=True)
+
+# ── Tab layout ────────────────────────────────────────────────────────────────
+tab_home, tab_threats, tab_clusters, tab_mitre, tab_monitor, tab_alerts, tab_settings, tab_models = st.tabs([
+    "🏠  Overview",
+    "🔒  Threats",
+    "🔗  Clusters",
+    "🧩  MITRE ATT&CK",
+    "📡  Monitoring",
     _alerts_label,
-    "⚙️ Settings",
-    "🤖 Model Evaluation",
+    "⚙️  Settings",
+    "📊  Model Evaluation",
 ])
 
-# ══════════════════════════════════════════════
-#  TAB 1 — THREATS  (original content, unchanged)
-# ══════════════════════════════════════════════
-with tab_threats:
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAB 1 — HOME / OVERVIEW
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_home:
+    # ── Hero headline ──────────────────────────────────────────────────────
+    runs = fetch_pipeline_runs(limit=1)
+    last_run_at = runs[0]["run_at"][:19].replace("T", " ") if runs else "—"
+    last_mode   = runs[0]["mode"]  if runs else "—"
 
-    # ── Filter + sort ──────────────────────────────────────────────────────
-    filtered = df[df["threat_type"].isin(type_filter)].copy()
-    if "predicted_priority" in filtered.columns:
-        filtered = filtered[filtered["predicted_priority"].isin(priority_filter)]
-
-    PRIORITY_RANK = {"Critical": 3, "High": 2, "Medium": 1, "Low": 0}
-    if "predicted_priority" in filtered.columns:
-        filtered["_priority_rank"] = filtered["predicted_priority"].map(PRIORITY_RANK).fillna(-1)
-        score_col = "predicted_priority_score" if "predicted_priority_score" in filtered.columns else "severity_raw"
-        filtered = filtered.sort_values(
-            ["_priority_rank", score_col], ascending=[not sort_desc, not sort_desc]
-        ).drop(columns="_priority_rank")
-    else:
-        filtered = filtered.sort_values("severity_raw", ascending=not sort_desc)
-
-    filtered = filtered.reset_index(drop=True)
-
-    # ── Pagination state ───────────────────────────────────────────────────
-    total_rows = len(filtered)
-    total_pages = max(1, -(-total_rows // rows_per_page))
-
-    if "current_page" not in st.session_state:
-        st.session_state.current_page = 1
-    if st.session_state.current_page > total_pages:
-        st.session_state.current_page = 1
-
-    current_page = st.session_state.current_page
-    start_idx = (current_page - 1) * rows_per_page
-    end_idx = min(start_idx + rows_per_page, total_rows)
-    page_df = filtered.iloc[start_idx:end_idx]
-
-    # ── Ranked table ───────────────────────────────────────────────────────
-    st.markdown(
-        f"### Ranked Threats &nbsp; "
-        f"<span style='color:#7c5cbf;font-size:0.9rem;font-weight:400;'>({total_rows:,} total)</span>",
-        unsafe_allow_html=True,
-    )
-
-    display_cols = [
-        "id", "threat_type", "title", "severity_raw", "predicted_priority",
-        "predicted_priority_score", "context_adjusted_score", "heuristic_label", "analyst_label",
-        "cluster_id", "source", "last_seen",
-    ]
-    display_cols = [c for c in display_cols if c in page_df.columns]
-
-    col_rename = {
-        "id": "ID",
-        "threat_type": "Type",
-        "title": "Title",
-        "severity_raw": "Severity",
-        "predicted_priority": "ML Priority",
-        "predicted_priority_score": "ML Rank Score",
-        "context_adjusted_score": "Ctx Score",
-        "heuristic_label": "Heuristic Label",
-        "analyst_label": "Analyst Label",
-        "cluster_id": "Cluster",
-        "source": "Source",
-        "last_seen": "Last Seen",
-    }
-    display_df = page_df[display_cols].rename(columns=col_rename)
-
-    if "Severity" in display_df.columns:
-        display_df["Severity"] = display_df["Severity"].round(2)
-    if "ML Rank Score" in display_df.columns:
-        display_df["ML Rank Score"] = display_df["ML Rank Score"].round(4)
-
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        height=min(42 * rows_per_page + 60, 700),
-        hide_index=True,
-    )
-
-    # ── Pagination controls ────────────────────────────────────────────────
-    st.markdown(
-        f"<div class='page-info'>Showing {start_idx + 1}–{end_idx} of {total_rows:,} threats</div>",
-        unsafe_allow_html=True,
-    )
-
-    MAX_PAGE_BUTTONS = 7
-    half = MAX_PAGE_BUTTONS // 2
-    if total_pages <= MAX_PAGE_BUTTONS:
-        page_numbers = list(range(1, total_pages + 1))
-    else:
-        if current_page <= half + 1:
-            page_numbers = list(range(1, MAX_PAGE_BUTTONS + 1))
-        elif current_page >= total_pages - half:
-            page_numbers = list(range(total_pages - MAX_PAGE_BUTTONS + 1, total_pages + 1))
-        else:
-            page_numbers = list(range(current_page - half, current_page + half + 1))
-
-    n_cols = len(page_numbers) + 2
-    nav_cols = st.columns([1] * n_cols, gap="small")
-
-    with nav_cols[0]:
-        if st.button("← Prev", disabled=(current_page == 1), key="prev_btn"):
-            st.session_state.current_page -= 1
-            st.rerun()
-
-    for i, pg in enumerate(page_numbers):
-        with nav_cols[i + 1]:
-            label = f"**{pg}**" if pg == current_page else str(pg)
-            btn_type = "primary" if pg == current_page else "secondary"
-            if st.button(label, key=f"page_{pg}", type=btn_type):
-                st.session_state.current_page = pg
-                st.rerun()
-
-    with nav_cols[-1]:
-        if st.button("Next →", disabled=(current_page == total_pages), key="next_btn"):
-            st.session_state.current_page += 1
-            st.rerun()
-
-    st.divider()
-
-    # ── Drill-down on a single threat ──────────────────────────────────────
-    st.markdown("### 🔎 Threat Details")
-    selected_id = st.selectbox(
-        "Select a threat ID to inspect",
-        options=filtered["id"].tolist(),
-        format_func=lambda x: f"{x[:70]}..." if len(str(x)) > 70 else x,
-    )
-    if selected_id:
-        record = filtered[filtered["id"] == selected_id].iloc[0]
-
-        priority_colors = {
-            "Critical": "#fda4af", "High": "#fdba74",
-            "Medium":   "#fde68a", "Low":  "#86efac",
-        }
-        priority_bg = {
-            "Critical": "#4c0519", "High": "#431407",
-            "Medium":   "#3b2509", "Low":  "#052e16",
-        }
-        priority_border = {
-            "Critical": "#9f1239", "High": "#9a3412",
-            "Medium":   "#92400e", "Low":  "#166534",
-        }
-        priority_val   = record.get("predicted_priority", "—")
-        p_color  = priority_colors.get(priority_val, "#c4b5fd")
-        p_bg     = priority_bg.get(priority_val,     "#1a0a3d")
-        p_border = priority_border.get(priority_val, "#4a1d96")
-
-        # ── Header banner ──────────────────────────────────────────────────
-        threat_type = record.get("threat_type", "")
-        type_icon   = "🛡️" if threat_type == "cve" else "🌐" if threat_type == "malicious_ip" else "⚠️"
-        st.markdown(
-            f"""
-<div style='background:linear-gradient(135deg,#1e0a4a,#2d1066);
-            border:1px solid #6d28d9;border-radius:14px;
-            padding:18px 22px;margin-bottom:18px;'>
-  <div style='display:flex;align-items:center;gap:12px;flex-wrap:wrap;'>
-    <span style='font-size:1.6rem;'>{type_icon}</span>
-    <span style='color:#e9d5ff;font-size:1.25rem;font-weight:800;'>{record['title']}</span>
-    <span style='background:{p_bg};color:{p_color};border:1px solid {p_border};
-                 border-radius:20px;padding:3px 12px;font-size:0.8rem;font-weight:700;'>
-      {priority_val}
-    </span>
-    <span style='background:#1a0a3d;color:#a78bfa;border:1px solid #4a1d96;
-                 border-radius:20px;padding:3px 12px;font-size:0.78rem;'>
-      {threat_type.replace("_", " ").title()}
-    </span>
+    st.markdown(f"""
+<div style='margin-bottom:32px;'>
+  <span class='eyebrow'>Threat Intelligence Platform</span>
+  <div style='font-family:Fraunces,Georgia,serif;font-size:2.6rem;font-weight:400;
+              color:#043f2e;letter-spacing:-0.03em;line-height:1.0;margin-bottom:8px;'>
+    {len(df):,} threats ranked,<br>ready for triage.
   </div>
-</div>""",
-            unsafe_allow_html=True,
-        )
+  <div style='color:#6b7c6a;font-size:0.85rem;'>
+    Last pipeline run: <strong style='color:#043f2e;'>{last_run_at}</strong>
+    &nbsp;·&nbsp; Mode: <strong style='color:#043f2e;'>{last_mode}</strong>
+    &nbsp;·&nbsp; Sources: NVD · AbuseIPDB
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-        # ── Metric strip ───────────────────────────────────────────────────
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Severity", f"{record['severity_raw']}/10")
-        m2.metric("ML Priority",    priority_val)
-        m3.metric("Rank Score",     f"{round(record.get('predicted_priority_score', 0) or 0, 3)}")
-        m4.metric("Report Count",   record.get("report_count", "—"))
-        clid = record.get("cluster_id")
-        m5.metric("Cluster",        int(clid) if pd.notna(clid) else "—")
+    # ── KPI row ────────────────────────────────────────────────────────────
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Critical",     _n_critical)
+    c2.metric("High",         _n_high)
+    c3.metric("Medium",       _n_medium)
+    c4.metric("CVEs",         _n_cves)
+    c5.metric("Malicious IPs",_n_ips)
+    c6.metric("Exploited",    _n_exploited)
 
-        st.markdown("")
+    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
 
-        # ── Two-column detail + raw fields ────────────────────────────────
-        detail_col, raw_col = st.columns([3, 2])
+    left_col, right_col = st.columns([3, 2], gap="large")
 
-        with detail_col:
-            st.markdown("##### 📋 Record Details")
-            st.markdown(f"**ID:** `{record['id']}`")
-            st.markdown(f"**Source:** `{record.get('source', '—')}`")
-            st.markdown(f"**Source reliability:** `{record.get('source_reliability', '—')}`")
-            st.markdown(f"**First seen:** `{record.get('first_seen', '—')}`")
-            st.markdown(f"**Last seen:** `{record.get('last_seen', '—')}`")
-            st.markdown(f"**Heuristic label:** `{record.get('heuristic_label', '—')}`")
-            exploited = bool(int(record.get("exploited_flag") or 0))
-            exp_color = "#fda4af" if exploited else "#86efac"
-            exp_text  = "YES — exploitation evidence present" if exploited else "No exploitation evidence in current data"
-            st.markdown(
-                f"**Exploitation flag:** <span style='color:{exp_color};font-weight:600;'>{exp_text}</span>",
-                unsafe_allow_html=True,
-            )
-            if record.get("description"):
-                st.markdown("**Raw description:**")
+    with left_col:
+        # ── Active alerts strip (max 5) ────────────────────────────────────
+        new_alerts = _fetch_alerts(status_filter="new", limit=5)
+        if new_alerts:
+            st.markdown("<span class='eyebrow'>Active Alerts</span>", unsafe_allow_html=True)
+            ALERT_STYLE = {
+                "critical": ("alert-critical", "🔴"),
+                "high":     ("alert-high",     "🟠"),
+                "warning":  ("alert-warning",  "🟡"),
+                "info":     ("alert-info",      "🟢"),
+            }
+            for al in new_alerts:
+                sev   = al.get("severity", "info").lower()
+                cls, dot = ALERT_STYLE.get(sev, ("alert-info", "•"))
+                msg   = al.get("message", "")
+                atype = al.get("alert_type", "").replace("_", " ").title()
+                tid   = str(al.get("threat_id") or "")
+                tid   = "" if tid in ("nan", "None") else tid
                 st.markdown(
-                    f"<div style='background:#130d2e;border-left:3px solid #6d28d9;"
-                    f"border-radius:4px;padding:10px 14px;color:#c4b5fd;"
-                    f"font-size:0.88rem;line-height:1.6;'>"
-                    f"{record['description']}</div>",
+                    f"<div class='{cls}'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:flex-start;'>"
+                    f"<div>"
+                    f"<span style='font-size:11px;font-weight:700;text-transform:uppercase;"
+                    f"letter-spacing:0.06em;color:#6b7c6a;'>{dot} {atype}</span>"
+                    f"<div style='font-size:0.88rem;color:#043f2e;margin-top:3px;'>{msg[:120]}</div>"
+                    f"{'<div style=\"font-size:0.75rem;color:#6b7c6a;margin-top:3px;\">ID: ' + tid[:40] + '</div>' if tid else ''}"
+                    f"</div>"
+                    f"</div>"
+                    f"</div>",
                     unsafe_allow_html=True,
                 )
-
-        with raw_col:
-            st.markdown("##### 🔬 Extra Fields")
-            if record.get("extra_json"):
-                try:
-                    extra_data = json.loads(record["extra_json"]) if isinstance(record["extra_json"], str) else record["extra_json"]
-                    for k, v in extra_data.items():
-                        if v is not None and v != "" and v != "unknown":
-                            st.markdown(f"**{k.replace('_', ' ').title()}:** `{v}`")
-                except Exception:
-                    st.text(record["extra_json"])
-            else:
-                st.caption("No extra fields available.")
-
-        st.divider()
-
-        # ── AI-generated Threat Summary ────────────────────────────────────
-        st.markdown("##### 🧠 AI-Generated Threat Summary")
-        st.caption(
-            "Deterministic template-based analysis — fully reproducible, offline-capable, "
-            "and grounded strictly in the structured data fields above. Not an LLM."
-        )
-
-        ai_summary = record.get("ai_summary", "")
-
-        if not ai_summary:
-            # Generate on-the-fly if the pipeline hasn't written one yet
-            from src.pipeline.summarizer import generate_summary
-            ai_summary = generate_summary(dict(record))
-
-        # Render each section as a styled card
-        sections = [s.strip() for s in ai_summary.split("\n\n") if s.strip()]
-        section_icons = {
-            "What this threat is":   "📌",
-            "Why it matters":        "⚡",
-            "Severity":              "🎯",
-            "Exploitation status":   "💥",
-            "Relevant indicators":   "📊",
-            "Priority assigned":     "🏷️",
-            "Analyst recommendation":"💡",
-        }
-
-        for section in sections:
-            # Extract the bold header (text between ** and **)
-            header = ""
-            if section.startswith("**"):
-                end = section.find("**", 2)
-                if end > 2:
-                    header = section[2:end].rstrip(":")
-            icon = next((v for k, v in section_icons.items() if k.lower() in header.lower()), "•")
-
-            is_rec = "recommendation" in header.lower()
-            bg_color  = "#1c0a38" if not is_rec else "#0a2218"
-            border_c  = "#4a1d96" if not is_rec else "#166534"
-            hdr_color = "#c084fc" if not is_rec else "#86efac"
-
-            body_html = (
-                section
-                .replace("**" + header + ":**\n", "")
-                .replace("**" + header + ":**",    "")
-                .replace("**" + header + "**\n",   "")
-                .replace("\n- ", "<br>• ")
-                .replace("\n",   "<br>")
-            )
-            # Bold inline **text**
-            import re as _re
-            body_html = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body_html)
-
-            st.markdown(
-                f"""
-<div style='background:{bg_color};border:1px solid {border_c};border-left:4px solid {border_c};
-            border-radius:10px;padding:14px 18px;margin-bottom:10px;'>
-  <div style='color:{hdr_color};font-weight:700;font-size:0.92rem;margin-bottom:6px;'>
-    {icon} {header}
-  </div>
-  <div style='color:#c4b5fd;font-size:0.88rem;line-height:1.65;'>
-    {body_html}
-  </div>
-</div>""",
-                unsafe_allow_html=True,
-            )
-
-        st.divider()
-
-        # ── Phase 8: Why this priority? ────────────────────────────────────
-        st.markdown("##### 🔍 Why This Priority?")
-        st.caption(
-            "Feature contribution analysis — shows which input signals most influenced "
-            "the ML model's priority assignment. Derived from the Random Forest's own "
-            "feature importances, not a post-hoc approximation."
-        )
-
-        explanation_json_raw = record.get("explanation_json")
-        exp_data = None
-        if explanation_json_raw:
-            try:
-                exp_data = json.loads(explanation_json_raw) if isinstance(explanation_json_raw, str) else explanation_json_raw
-            except (ValueError, TypeError):
-                exp_data = None
-
-        if not exp_data:
-            # Generate on-the-fly if pipeline hasn't written it yet
-            try:
-                import joblib as _joblib
-                from src.pipeline.explainer import explain_prediction as _explain_pred
-                from src.pipeline.feature_engineering import build_feature_matrix as _build_feat
-                from src.config import MODELS_DIR as _MODELS_DIR
-                _model = _joblib.load(_MODELS_DIR / "random_forest.joblib")
-                _feats, _fcols = _build_feat([dict(record)])
-                if not _feats.empty:
-                    _row_dict = _feats.iloc[0].to_dict()
-                    _row_dict.update({k: v for k, v in dict(record).items() if k not in _row_dict})
-                    exp_data = _explain_pred(_row_dict, _model, _fcols)
-            except Exception:
-                exp_data = None
-
-        if not exp_data:
-            st.markdown(
-                "<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:8px;"
-                "padding:12px 16px;color:#7c5cbf;font-size:0.86rem;'>"
-                "Explanation not available yet. Re-run the pipeline to generate explanations."
-                "</div>",
-                unsafe_allow_html=True,
-            )
+            if _unack > 5:
+                st.markdown(
+                    f"<div style='text-align:right;font-size:0.8rem;color:#6b7c6a;margin-top:4px;'>"
+                    f"+ {_unack - 5} more unread alerts — see Alerts tab</div>",
+                    unsafe_allow_html=True,
+                )
+            st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
         else:
-            # Plain-English summary
-            plain = exp_data.get("plain_english", "")
-            method_label = "SHAP" if exp_data.get("method") == "shap" else "Feature Contribution"
-            confidence = exp_data.get("confidence", 0)
-
             st.markdown(
-                f"<div style='background:#0a2218;border:1px solid #166534;border-left:4px solid #166534;"
-                f"border-radius:8px;padding:12px 16px;margin-bottom:12px;'>"
-                f"<span style='color:#86efac;font-weight:700;font-size:0.9rem;'>💡 </span>"
-                f"<span style='color:#d1fae5;font-size:0.9rem;'>{plain}</span>"
-                f"<span style='color:#5b21b6;font-size:0.76rem;margin-left:10px;'>[{method_label}]</span>"
+                "<div class='card' style='text-align:center;color:#6b7c6a;padding:28px;'>"
+                "✅ No unread alerts — threat landscape is stable.</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+        # ── Top 10 threats by score ────────────────────────────────────────
+        st.markdown("<span class='eyebrow'>Top Priority Threats</span>", unsafe_allow_html=True)
+        PRIORITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
+        top_df = df.copy()
+        if "predicted_priority" in top_df.columns:
+            top_df["_r"] = top_df["predicted_priority"].map(PRIORITY_RANK).fillna(0)
+            sc = "predicted_priority_score" if "predicted_priority_score" in top_df.columns else "severity_raw"
+            top_df = top_df.sort_values(["_r", sc], ascending=[False, False]).head(10)
+
+        P_COLOR = {"Critical": "#dc2626", "High": "#ea580c", "Medium": "#ca8a04", "Low": "#16a34a"}
+        P_BG    = {"Critical": "#fef2f2", "High": "#fff7ed", "Medium": "#fefce8", "Low": "#f0fdf4"}
+        P_LEFT  = {"Critical": "threat-row-critical", "High": "threat-row-high",
+                   "Medium":   "threat-row-medium",   "Low":  "threat-row-low"}
+
+        for _, row in top_df.iterrows():
+            pv   = row.get("predicted_priority", "—")
+            pc   = P_COLOR.get(pv, "#043f2e")
+            pb   = P_BG.get(pv,    "#fcfcfc")
+            pcls = P_LEFT.get(pv,  "")
+            sev  = row.get("severity_raw", 0)
+            tid  = str(row.get("id", ""))
+            ttl  = str(row.get("title", tid))[:60]
+            src  = row.get("source", "")
+            exp  = bool(int(row.get("exploited_flag") or 0))
+            exp_tag = ("<span style='background:#fef2f2;color:#991b1b;border-radius:9999px;"
+                       "padding:1px 7px;font-size:10px;font-weight:600;margin-left:6px;'>EXPLOIT</span>"
+                       if exp else "")
+            st.markdown(
+                f"<div class='threat-row {pcls}'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center;gap:12px;'>"
+                f"<div style='flex:1;min-width:0;'>"
+                f"<div style='font-size:0.88rem;font-weight:500;color:#043f2e;"
+                f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
+                f"{ttl}{exp_tag}</div>"
+                f"<div style='font-size:0.75rem;color:#6b7c6a;margin-top:2px;'>"
+                f"{src} · Sev {sev}/10</div>"
+                f"</div>"
+                f"<span class='pill' style='background:{pb};color:{pc};border:1px solid {pc}44;"
+                f"white-space:nowrap;'>{pv}</span>"
+                f"</div>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
 
-            # Horizontal bar chart of top-5 feature contributions
-            top_feats = exp_data.get("top_features", [])
-            if top_feats:
-                feat_labels = [f["label"] for f in top_feats]
-                feat_contribs = [f["contribution"] for f in top_feats]
-                feat_values   = [f["value"]        for f in top_feats]
-                bar_colors    = [
-                    "#86efac" if c >= 0 else "#fda4af"
-                    for c in feat_contribs
-                ]
+    with right_col:
+        # ── Priority donut ─────────────────────────────────────────────────
+        st.markdown("<span class='eyebrow'>Priority Distribution</span>", unsafe_allow_html=True)
 
-                fig_exp, ax_exp = plt.subplots(figsize=(7, max(2.2, len(top_feats) * 0.55)))
-                fig_exp.patch.set_facecolor("#0d0d1a")
-                ax_exp.set_facecolor("#130d2e")
-                bars = ax_exp.barh(
-                    feat_labels[::-1], [abs(c) for c in feat_contribs[::-1]],
-                    color=bar_colors[::-1], edgecolor="#4a1d96", linewidth=0.7,
-                )
-                ax_exp.set_xlabel("Contribution (absolute)", color="#a78bfa", fontsize=8)
-                ax_exp.set_title(
-                    f"Top Feature Contributions → {exp_data.get('predicted_class','?')}",
-                    color="#c084fc", fontsize=10, fontweight="bold",
-                )
-                ax_exp.tick_params(colors="#c4b5fd", labelsize=8)
-                ax_exp.spines[:].set_color("#4a1d96")
-                # Annotate each bar with the actual feature value
-                for bar, val, contrib in zip(bars, feat_values[::-1], feat_contribs[::-1]):
-                    sign = "+" if contrib >= 0 else "−"
-                    ax_exp.text(
-                        bar.get_width() + 0.001,
-                        bar.get_y() + bar.get_height() / 2,
-                        f"{sign}  val={val:.3f}",
-                        va="center", color="#c4b5fd", fontsize=7.5,
-                    )
-                plt.tight_layout(pad=0.4)
-                st.pyplot(fig_exp, use_container_width=True)
-                plt.close(fig_exp)
+        labels_o = ["Critical", "High", "Medium", "Low"]
+        values_o = [_n_critical, _n_high, _n_medium, _n_low]
+        colors_o = ["#dc2626", "#ea580c", "#ca8a04", "#16a34a"]
+        nonzero  = [(l, v, c) for l, v, c in zip(labels_o, values_o, colors_o) if v > 0]
 
-                # Feature table
-                tbl_rows = ""
-                for f in top_feats:
-                    dirn_col = "#86efac" if f["direction"] == "+" else "#fda4af"
-                    tbl_rows += (
-                        f"<tr>"
-                        f"<td style='color:#c4b5fd;'>{f['label']}</td>"
-                        f"<td style='text-align:right;'>{f['value']:.4f}</td>"
-                        f"<td style='text-align:right;color:{dirn_col};font-weight:700;'>"
-                        f"{f['direction']}{abs(f['contribution']):.4f}</td>"
-                        f"</tr>"
-                    )
+        if nonzero:
+            lbls, vals, cols = zip(*nonzero)
+            fig_d, ax_d = plt.subplots(figsize=(4, 4))
+            fig_d.patch.set_facecolor("#eef2e3")
+            ax_d.set_facecolor("#eef2e3")
+            wedges, _ = ax_d.pie(
+                vals, colors=cols, startangle=90, counterclock=False,
+                wedgeprops={"width": 0.52, "edgecolor": "#eef2e3", "linewidth": 3},
+            )
+            ax_d.text(0, 0, f"{sum(vals):,}", ha="center", va="center",
+                      fontsize=18, fontweight="600", color="#043f2e")
+            ax_d.legend(
+                wedges, [f"{l}  {v:,}" for l, v in zip(lbls, vals)],
+                loc="lower center", bbox_to_anchor=(0.5, -0.12),
+                ncol=2, frameon=False, fontsize=9,
+                labelcolor="#043f2e",
+            )
+            plt.tight_layout()
+            st.pyplot(fig_d, use_container_width=True)
+            plt.close(fig_d)
+
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+        # ── Source split ───────────────────────────────────────────────────
+        st.markdown("<span class='eyebrow'>Source Breakdown</span>", unsafe_allow_html=True)
+        src_counts = df["source"].value_counts()
+        total_src  = src_counts.sum()
+        for src_name, cnt in src_counts.items():
+            pct = cnt / total_src * 100
+            st.markdown(
+                f"<div style='margin-bottom:8px;'>"
+                f"<div style='display:flex;justify-content:space-between;"
+                f"font-size:0.82rem;color:#043f2e;margin-bottom:3px;'>"
+                f"<span style='font-weight:500;'>{src_name}</span>"
+                f"<span style='color:#6b7c6a;'>{cnt:,}  ({pct:.0f}%)</span></div>"
+                f"<div style='background:#e8edd9;border-radius:9999px;height:5px;'>"
+                f"<div style='background:#043f2e;width:{pct:.0f}%;height:5px;"
+                f"border-radius:9999px;'></div></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+        # ── Recent activity feed ───────────────────────────────────────────
+        st.markdown("<span class='eyebrow'>Recent Activity</span>", unsafe_allow_html=True)
+        hist = fetch_threat_history(limit=8)
+        if hist:
+            DOT = {"new": "dot-new", "escalated": "dot-escalate", "reduced": "dot-reduced"}
+            for h in hist[:6]:
+                ct    = h.get("change_type", "")
+                dotcls= DOT.get(ct, "dot-new")
+                hid   = str(h.get("threat_id", ""))[:28]
+                prev  = h.get("previous_priority") or "—"
+                new_p = h.get("new_priority") or "—"
+                ts    = str(h.get("run_at", ""))[:16].replace("T", " ")
+                arrow = f"{prev} → {new_p}" if ct != "new" else f"New · {new_p}"
                 st.markdown(
-                    "<div style='margin-top:8px;'>"
-                    "<table style='width:100%;border-collapse:collapse;font-size:0.82rem;'>"
-                    "<thead><tr>"
-                    "<th style='color:#a78bfa;font-weight:700;text-align:left;padding:4px 8px;"
-                    "border-bottom:1px solid #4a1d96;'>Feature</th>"
-                    "<th style='color:#a78bfa;font-weight:700;text-align:right;padding:4px 8px;"
-                    "border-bottom:1px solid #4a1d96;'>Value</th>"
-                    "<th style='color:#a78bfa;font-weight:700;text-align:right;padding:4px 8px;"
-                    "border-bottom:1px solid #4a1d96;'>Contribution</th>"
-                    "</tr></thead>"
-                    f"<tbody>{tbl_rows}</tbody></table></div>",
+                    f"<div style='display:flex;align-items:flex-start;gap:8px;"
+                    f"padding:7px 0;border-bottom:1px solid #e8edd9;'>"
+                    f"<span class='{dotcls}' style='margin-top:5px;flex-shrink:0;'></span>"
+                    f"<div><div style='font-size:0.82rem;color:#043f2e;font-weight:500;'>{hid}</div>"
+                    f"<div style='font-size:0.75rem;color:#6b7c6a;'>{arrow} · {ts}</div>"
+                    f"</div></div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("No activity history yet. Run the pipeline twice to see changes.")
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='text-align:center;font-size:0.75rem;color:#6b7c6a;padding-top:12px;"
+        "border-top:1px solid #e8edd9;'>⚠ Priority labels are heuristic — not analyst-verified ground truth</div>",
+        unsafe_allow_html=True,
+    )
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAB 2 — THREATS (expandable cards)
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_threats:
+
+    # ── Sidebar-style filters inline ──────────────────────────────────────
+    st.markdown("<span class='eyebrow'>Filter & Sort</span>", unsafe_allow_html=True)
+    fc1, fc2, fc3, fc4 = st.columns([2, 2, 1, 1])
+
+    with fc1:
+        type_opts = sorted(df["threat_type"].dropna().unique().tolist())
+        type_filter = st.multiselect("Type", options=type_opts, default=type_opts, label_visibility="collapsed",
+                                     placeholder="All types")
+    with fc2:
+        prio_opts = ["Critical", "High", "Medium", "Low"]
+        avail_p   = [p for p in prio_opts if p in df.get("predicted_priority", pd.Series()).values] or prio_opts
+        prio_filter = st.multiselect("Priority", options=prio_opts, default=avail_p, label_visibility="collapsed",
+                                     placeholder="All priorities")
+    with fc3:
+        src_opts = ["All"] + sorted(df["source"].dropna().unique().tolist())
+        src_filter = st.selectbox("Source", options=src_opts, label_visibility="collapsed")
+    with fc4:
+        show_exploited = st.checkbox("Exploited only", value=False)
+
+    # Apply filters
+    filtered = df.copy()
+    if type_filter:
+        filtered = filtered[filtered["threat_type"].isin(type_filter)]
+    if prio_filter and "predicted_priority" in filtered.columns:
+        filtered = filtered[filtered["predicted_priority"].isin(prio_filter)]
+    if src_filter != "All":
+        filtered = filtered[filtered["source"] == src_filter]
+    if show_exploited:
+        filtered = filtered[filtered["exploited_flag"].fillna(0).astype(int) == 1]
+
+    # Sort
+    if "predicted_priority" in filtered.columns:
+        filtered["_r"] = filtered["predicted_priority"].map(PRIORITY_RANK).fillna(0)
+        sc = "predicted_priority_score" if "predicted_priority_score" in filtered.columns else "severity_raw"
+        filtered = filtered.sort_values(["_r", sc], ascending=[False, False]).drop(columns="_r")
+    filtered = filtered.reset_index(drop=True)
+
+    total_rows = len(filtered)
+    st.markdown(
+        f"<div style='font-size:0.85rem;color:#6b7c6a;margin:8px 0 16px;'>"
+        f"Showing <strong style='color:#043f2e;'>{total_rows:,}</strong> threats</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Pagination
+    PAGE_SZ = 20
+    total_pages = max(1, -(-total_rows // PAGE_SZ))
+    if "t_page" not in st.session_state:
+        st.session_state.t_page = 1
+    if st.session_state.t_page > total_pages:
+        st.session_state.t_page = 1
+
+    start_i = (st.session_state.t_page - 1) * PAGE_SZ
+    end_i   = min(start_i + PAGE_SZ, total_rows)
+    page_df = filtered.iloc[start_i:end_i]
+
+    # ── Threat cards ──────────────────────────────────────────────────────
+    for _, row in page_df.iterrows():
+        pv   = str(row.get("predicted_priority", "—"))
+        pc   = P_COLOR.get(pv, "#043f2e")
+        pb   = P_BG.get(pv,    "#fcfcfc")
+        pcls = P_LEFT.get(pv,  "")
+        sev  = row.get("severity_raw", 0)
+        tid  = str(row.get("id", ""))
+        ttl  = str(row.get("title", tid))
+        src  = str(row.get("source", ""))
+        ttype= str(row.get("threat_type", "")).replace("_", " ").title()
+        exp  = bool(int(row.get("exploited_flag") or 0))
+        cid  = row.get("cluster_id")
+        clid = f"C{int(cid)}" if pd.notna(cid) else "—"
+        score= round(float(row.get("predicted_priority_score") or 0), 3)
+        analyst_lbl = row.get("analyst_label")
+
+        exp_tag = (" · <span style='color:#991b1b;font-weight:600;font-size:10px;'>EXPLOIT</span>" if exp else "")
+
+        with st.expander(
+            f"{ttl[:65]}{'...' if len(ttl)>65 else ''}  ·  {pv}  ·  Sev {sev}/10{' · ⚡ EXPLOIT' if exp else ''}",
+            expanded=False,
+        ):
+            # Header strip inside expander
+            st.markdown(
+                f"<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;"
+                f"padding:10px 0 14px;border-bottom:1px solid #e8edd9;margin-bottom:14px;'>"
+                f"<span class='pill' style='background:{pb};color:{pc};border:1px solid {pc}44;'>{pv}</span>"
+                f"<span class='pill' style='background:#eef2e3;color:#043f2e;border:none;'>{ttype}</span>"
+                f"<span class='pill' style='background:#eef2e3;color:#043f2e;border:none;'>Cluster {clid}</span>"
+                f"<span class='pill' style='background:#eef2e3;color:#043f2e;border:none;'>{src}</span>"
+                f"{'<span class=\"pill\" style=\"background:#fef2f2;color:#991b1b;border:none;\">⚡ Exploit evidence</span>' if exp else ''}"
+                f"{'<span class=\"pill pill-chartreuse\">✓ ' + str(analyst_lbl).replace('_',' ') + '</span>' if analyst_lbl and str(analyst_lbl) not in ('None','nan') else ''}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Severity", f"{sev}/10")
+            d2.metric("ML Score",  score)
+            d3.metric("Reports",   row.get("report_count", "—"))
+
+            st.markdown("")
+
+            # Description
+            desc = str(row.get("description") or "")
+            if desc:
+                st.markdown(
+                    f"<div style='background:#eef2e3;border-radius:8px;padding:12px 14px;"
+                    f"font-size:0.86rem;color:#043f2e;line-height:1.6;margin-bottom:12px;'>"
+                    f"{desc[:400]}{'...' if len(desc)>400 else ''}</div>",
                     unsafe_allow_html=True,
                 )
 
-        st.divider()
-
-        # ── MITRE ATT&CK mappings for this specific threat ─────────────────
-        st.markdown("##### 🧩 MITRE ATT&CK Associations")
-
-        from src.pipeline.db import fetch_mitre_for_threat as _fetch_mitre
-        threat_mitre = _fetch_mitre(selected_id)
-
-        CONF_STYLES = {
-            "High":   ("#052e16", "#86efac", "#166534"),
-            "Medium": ("#3b2509", "#fde68a", "#92400e"),
-            "Low":    ("#431407", "#fdba74", "#9a3412"),
-        }
-
-        if not threat_mitre:
-            st.markdown(
-                "<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:8px;"
-                "padding:12px 16px;color:#7c5cbf;font-size:0.86rem;'>"
-                "No MITRE ATT&CK mappings available for this threat. "
-                "This may occur when the CVE has no CWE assignment and the description "
-                "does not contain recognisable technique keywords, or when this is a "
-                "malicious IP record with no additional context signals."
-                "</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.caption(
-                f"{len(threat_mitre)} technique(s) inferred. "
-                "Confidence reflects the strength of the evidence: "
-                "High = CWE-based · Medium = keyword-based · Low = type-level inference."
-            )
-            for m in threat_mitre:
-                conf = m.get("confidence", "Low")
-                mbg, mfg, mborder = CONF_STYLES.get(conf, CONF_STYLES["Low"])
-                tech_id   = m["technique_id"]
-                tech_url  = (
-                    "https://attack.mitre.org/techniques/"
-                    + tech_id.replace(".", "/")
-                )
-                st.markdown(
-                    f"""
-<div style='background:{mbg};border:1px solid {mborder};border-left:4px solid {mborder};
-            border-radius:8px;padding:12px 16px;margin-bottom:8px;'>
-  <div style='display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;'>
-    <div>
-      <span style='background:{mborder}55;color:{mfg};border-radius:10px;
-                   padding:2px 8px;font-size:0.72rem;font-weight:700;
-                   letter-spacing:0.5px;'>{conf.upper()}</span>
-      <span style='color:#e9d5ff;font-weight:700;font-size:0.95rem;margin-left:8px;'>
-        {tech_id}
-      </span>
-      <span style='color:#c4b5fd;font-size:0.9rem;margin-left:4px;'>
-        — {m['technique_name']}
-      </span>
-      <div style='color:#a78bfa;font-size:0.82rem;margin-top:3px;'>
-        Tactic: <b>{m['tactic']}</b>
-      </div>
-    </div>
-    <a href='{tech_url}' target='_blank'
-       style='background:#2d1066;color:#c084fc;border:1px solid #6d28d9;
-              border-radius:6px;padding:3px 10px;font-size:0.76rem;
-              text-decoration:none;font-weight:600;white-space:nowrap;'>
-      ATT&amp;CK ↗
-    </a>
-  </div>
-  <div style='color:#9f7aea;font-size:0.8rem;margin-top:6px;
-              border-top:1px solid {mborder};padding-top:6px;'>
-    <b>Basis:</b> {m.get('basis', '—')}
-  </div>
-</div>""",
-                    unsafe_allow_html=True,
-                )
-
-    st.divider()
-
-    # ── Phase 9: Analyst Feedback ──────────────────────────────────────────
-    if selected_id:
-        st.markdown("### 🏷️ Analyst Feedback")
-        st.caption(
-            "Validate or correct the ML prediction. Analyst labels are stored separately "
-            "and never overwrite the heuristic or ML labels. All three labels are shown "
-            "side-by-side so discrepancies are immediately visible."
-        )
-
-        _record = filtered[filtered["id"] == selected_id].iloc[0]
-        _heuristic  = _record.get("heuristic_label",    "—")
-        _ml_pred    = _record.get("predicted_priority",  "—")
-        _existing_fb = _fetch_feedback(selected_id)
-        _current_analyst_label = _existing_fb["analyst_label"] if _existing_fb else None
-
-        LABEL_COLORS = {
-            "Critical":           "#fda4af", "High":     "#fdba74",
-            "Medium":             "#fde68a", "Low":      "#86efac",
-            "Confirmed_Critical": "#fda4af", "Confirmed_High":   "#fdba74",
-            "Confirmed_Medium":   "#fde68a", "Confirmed_Low":    "#86efac",
-            "False_Positive":     "#93c5fd", "Needs_Review":     "#d8b4fe",
-        }
-        LABEL_BG = {
-            "Critical":           "#4c0519", "High":     "#431407",
-            "Medium":             "#3b2509", "Low":      "#052e16",
-            "Confirmed_Critical": "#4c0519", "Confirmed_High":   "#431407",
-            "Confirmed_Medium":   "#3b2509", "Confirmed_Low":    "#052e16",
-            "False_Positive":     "#0c1a4a", "Needs_Review":     "#2e1065",
-        }
-
-        def _label_chip(label, title):
-            fg = LABEL_COLORS.get(str(label) if label else "", "#c4b5fd")
-            bg = LABEL_BG.get(str(label) if label else "", "#1a0a3d")
-            disp = label if label else "—"
-            return (
-                f"<div style='text-align:center;'>"
-                f"<div style='color:#7c5cbf;font-size:0.72rem;font-weight:600;"
-                f"text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px;'>{title}</div>"
-                f"<span style='background:{bg};color:{fg};border:1px solid {fg}44;"
-                f"border-radius:20px;padding:4px 14px;font-size:0.82rem;font-weight:700;'>"
-                f"{disp}</span></div>"
-            )
-
-        chip_cols = st.columns(3)
-        chip_cols[0].markdown(_label_chip(_heuristic,  "Heuristic Label"),         unsafe_allow_html=True)
-        chip_cols[1].markdown(_label_chip(_ml_pred,    "ML Predicted"),            unsafe_allow_html=True)
-        chip_cols[2].markdown(_label_chip(_current_analyst_label, "Analyst Validated"), unsafe_allow_html=True)
-
-        st.markdown("")
-
-        with st.form(key=f"feedback_form_{selected_id}", clear_on_submit=False):
-            fc1, fc2, fc3 = st.columns([2, 3, 1.2])
-            _default_idx = (
-                _ANALYST_LABEL_OPTIONS.index(_current_analyst_label)
-                if _current_analyst_label and _current_analyst_label in _ANALYST_LABEL_OPTIONS
-                else 0
-            )
-            chosen_label = fc1.selectbox(
-                "Analyst Label", options=_ANALYST_LABEL_OPTIONS,
-                index=_default_idx, key=f"al_label_{selected_id}",
-                help="Select your validated priority assessment for this threat.",
-            )
-            chosen_notes = fc2.text_input(
-                "Notes (optional)",
-                value=_existing_fb["feedback_notes"] if _existing_fb and _existing_fb.get("feedback_notes") else "",
-                key=f"al_notes_{selected_id}",
-                placeholder="e.g. Confirmed via internal vuln scan, false positive — internal host",
-            )
-            fc3.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
-            submitted = fc3.form_submit_button("✅ Submit", type="primary")
-            if submitted:
-                _upsert_feedback(
-                    threat_id=selected_id,
-                    analyst_label=chosen_label,
-                    notes=chosen_notes,
-                    analyst_id="analyst_1",
-                )
-                st.success(f"Feedback saved: **{chosen_label}** for `{selected_id[:60]}`")
-                st.rerun()
-
-        if _existing_fb:
-            _ts_upd = str(_existing_fb.get("updated_at", ""))[:19].replace("T", " ")
-            st.markdown(
-                f"<div style='background:#1a0a3d;border:1px solid #4a1d96;"
-                f"border-radius:8px;padding:10px 16px;margin-top:6px;"
-                f"font-size:0.82rem;color:#9f7aea;'>"
-                f"Last updated: <b style='color:#c4b5fd;'>{_ts_upd}</b> "
-                f"by <b style='color:#c4b5fd;'>{_existing_fb.get('analyst_id','—')}</b>"
-                + (f"<br>Notes: <span style='color:#c4b5fd;'>{_existing_fb.get('feedback_notes','')}</span>"
-                   if _existing_fb.get("feedback_notes") else "")
-                + "</div>",
-                unsafe_allow_html=True,
-            )
-
-    st.divider()
-    st.caption(
-        "⚠️ Priority labels used for training are derived from a documented heuristic "
-        "(severity · exploitation signal · report volume · recency · source reliability · CWE risk · advisory breadth), "
-        "not analyst-verified ground truth. See README.md for details."
-    )
-
-
-# ══════════════════════════════════════════════
-#  TAB 2 — CLUSTERS  (Phase 1 — redesigned)
-# ══════════════════════════════════════════════
-with tab_clusters:
-
-    # ── Helper: generate NLP cluster summary ──────────────────────────────
-    def _cluster_nlp_summary(cid: int, g: pd.DataFrame, avg_sev: float,
-                              pct_exp: float, dominant: str, types_str: str,
-                              sources_str: str, n_critical: int, n_high: int) -> str:
-        """
-        Builds a deterministic, template-based analyst summary that explains:
-        - what kind of threats are in this cluster
-        - why they were grouped together (shared feature profile)
-        - why they may be concerning
-        - severity assessment
-        This is rule-based NLP, not an LLM — fully reproducible and offline.
-        """
-        n = len(g)
-        lines = []
-
-        # ── What kind of threats ──
-        has_cve = "cve" in types_str
-        has_ip  = "malicious_ip" in types_str
-        if has_cve and has_ip:
-            kind = "a mixed group of CVEs and malicious IP addresses"
-        elif has_cve:
-            kind = "CVE vulnerabilities"
-        else:
-            kind = "malicious IP addresses"
-
-        lines.append(
-            f"This cluster groups **{n} {kind}** that share a similar "
-            f"threat profile across severity, exploitation status, reporting volume, "
-            f"recency, and source reliability."
-        )
-
-        # ── Why grouped together (feature explanation) ──
-        clustering_reasons = []
-        if avg_sev >= 8.5:
-            clustering_reasons.append("uniformly very high severity scores (≥ 8.5/10)")
-        elif avg_sev >= 6.5:
-            clustering_reasons.append("consistently elevated severity scores (≥ 6.5/10)")
-        elif avg_sev >= 4.0:
-            clustering_reasons.append("moderate severity scores (4–6.5/10)")
-        else:
-            clustering_reasons.append("relatively low severity scores (< 4/10)")
-
-        if pct_exp >= 80:
-            clustering_reasons.append("nearly all members carry active exploitation evidence")
-        elif pct_exp >= 30:
-            clustering_reasons.append(f"a significant portion ({pct_exp:.0f}%) have exploitation indicators")
-        elif pct_exp == 0:
-            clustering_reasons.append("no members carry exploitation evidence in the available data")
-
-        if "abuseipdb" in sources_str and "nvd" not in sources_str:
-            clustering_reasons.append(
-                "all originate from AbuseIPDB, indicating community-reported abuse activity"
-            )
-        elif "nvd" in sources_str and "abuseipdb" not in sources_str:
-            clustering_reasons.append(
-                "all originate from NVD, reflecting formally catalogued software vulnerabilities"
-            )
-        else:
-            clustering_reasons.append(
-                "members span both NVD and AbuseIPDB, combining vulnerability and abuse-IP intelligence"
-            )
-
-        lines.append(
-            "**Why grouped together:** The K-Means algorithm placed these threats in the same "
-            "cluster because they scored similarly on: "
-            + "; ".join(clustering_reasons) + "."
-        )
-
-        # ── Why concerning / malicious ──
-        concern_lines = []
-        if has_ip:
-            concern_lines.append(
-                "The malicious IPs in this cluster have been independently reported to AbuseIPDB "
-                "with a confidence score above the platform threshold (≥ 50%), indicating "
-                "repeated abusive behaviour such as scanning, brute-force attacks, or spam."
-            )
-        if has_cve:
-            concern_lines.append(
-                "The CVEs represent formally catalogued software vulnerabilities with assigned "
-                "CVSS base scores. High CVSS scores indicate that exploitation could lead to "
-                "significant impact such as remote code execution, privilege escalation, or "
-                "data exposure."
-            )
-        if pct_exp > 0:
-            concern_lines.append(
-                f"Exploitation evidence is present for {pct_exp:.0f}% of this cluster's members, "
-                "meaning public exploit code or active exploitation has been observed — "
-                "these are not merely theoretical risks."
-            )
-        lines.append("**Why they may be concerning:** " + " ".join(concern_lines))
-
-        # ── Severity assessment ──
-        if avg_sev >= 9.0:
-            sev_verdict = (
-                f"**Severity assessment:** CRITICAL — average severity {avg_sev:.1f}/10. "
-                "This cluster warrants immediate analyst attention. Threats at this severity "
-                "level typically allow unauthenticated remote exploitation with critical impact."
-            )
-        elif avg_sev >= 7.0:
-            sev_verdict = (
-                f"**Severity assessment:** HIGH — average severity {avg_sev:.1f}/10. "
-                "These threats represent a significant risk. Analyst review and prompt "
-                "remediation or blocking is recommended."
-            )
-        elif avg_sev >= 4.5:
-            sev_verdict = (
-                f"**Severity assessment:** MEDIUM — average severity {avg_sev:.1f}/10. "
-                "These threats require attention but may be lower priority than Critical/High "
-                "clusters. Standard patch and monitoring processes apply."
-            )
-        else:
-            sev_verdict = (
-                f"**Severity assessment:** LOW — average severity {avg_sev:.1f}/10. "
-                "These threats pose a limited immediate risk based on available data. "
-                "Continue routine monitoring."
-            )
-        lines.append(sev_verdict)
-
-        # ── Priority breakdown ──
-        if n_critical > 0 or n_high > 0:
-            lines.append(
-                f"**Priority breakdown:** {n_critical} Critical · {n_high} High "
-                f"· {n - n_critical - n_high} Medium/Low threats in this cluster."
-            )
-
-        # ── Analyst recommendation ──
-        if avg_sev >= 8.5 or pct_exp >= 50:
-            rec = (
-                "Analyst recommendation: **Escalate immediately.** Cross-reference with your "
-                "organisation's asset inventory to confirm exposure. Consider emergency patching "
-                "or IP blocking for confirmed matches."
-            )
-        elif avg_sev >= 6.5 or n_high >= 5:
-            rec = (
-                "Analyst recommendation: **Review within 24–48 hours.** Verify whether affected "
-                "software or IP ranges are present in your environment and prioritise accordingly."
-            )
-        else:
-            rec = (
-                "Analyst recommendation: **Track and monitor.** Add to the watch list and "
-                "reassess if severity or exploitation status changes in the next pipeline run."
-            )
-        lines.append(rec)
-
-        return "\n\n".join(lines)
-
-
-    # ── Severity colour helpers ────────────────────────────────────────────
-    def _sev_color(avg_sev: float) -> str:
-        if avg_sev >= 9.0:   return "#ef4444"   # red   — critical
-        if avg_sev >= 7.0:   return "#f97316"   # orange — high
-        if avg_sev >= 4.5:   return "#eab308"   # yellow — medium
-        return "#22c55e"                          # green  — low
-
-    def _sev_label(avg_sev: float) -> str:
-        if avg_sev >= 9.0:  return "CRITICAL"
-        if avg_sev >= 7.0:  return "HIGH"
-        if avg_sev >= 4.5:  return "MEDIUM"
-        return "LOW"
-
-    def _priority_donut(g: pd.DataFrame, cid: int):
-        """Small donut chart showing priority breakdown for one cluster."""
-        if "predicted_priority" not in g.columns:
-            return None
-        counts = g["predicted_priority"].value_counts()
-        labels_order = ["Critical", "High", "Medium", "Low"]
-        colors_map = {
-            "Critical": "#ef4444", "High": "#f97316",
-            "Medium":   "#eab308", "Low":  "#22c55e",
-        }
-        present = [l for l in labels_order if l in counts]
-        vals    = [counts[l] for l in present]
-        cols    = [colors_map[l] for l in present]
-
-        fig, ax = plt.subplots(figsize=(2.8, 2.8))
-        fig.patch.set_facecolor("#1a0a3d")
-        ax.set_facecolor("#1a0a3d")
-        wedges, _ = ax.pie(
-            vals, labels=None, colors=cols,
-            startangle=90, counterclock=False,
-            wedgeprops={"width": 0.55, "edgecolor": "#1a0a3d", "linewidth": 2},
-        )
-        total = sum(vals)
-        ax.text(0, 0, str(total), ha="center", va="center",
-                color="#e9d5ff", fontsize=13, fontweight="bold")
-        ax.set_title(f"C{cid}", color="#c084fc", fontsize=9, fontweight="bold", pad=4)
-        plt.tight_layout(pad=0.3)
-        return fig
-
-    # ─────────────────────────────────────────────────────────────────────
-    st.markdown("### 🔗 Threat Clusters")
-
-    # Explanation box
-    st.markdown("""
-<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:10px;
-            padding:14px 18px;margin-bottom:16px;font-size:0.88rem;color:#c4b5fd;'>
-<b style='color:#a855f7'>How clustering works</b><br>
-Threats are grouped using <b>K-Means</b> on 7 features:
-<code>severity</code>, <code>exploited_flag</code>, <code>recency_score</code>,
-<code>report_count</code>, <code>source_reliability</code>, <code>is_cve</code>,
-<code>is_malicious_ip</code> — enriched with a lightweight TF-IDF text signal
-from titles/descriptions (weighted 30%). The number of clusters <b>k</b> is chosen
-automatically (k = 3–8) by maximising the <em>silhouette score</em>.<br><br>
-<b style='color:#a855f7'>Effect of reducing k:</b>
-Fewer clusters → each cluster becomes broader and less specific, mixing threats that are
-only loosely similar. This reduces the analyst's ability to distinguish
-high-severity CVEs from medium-risk IPs, for example.
-A lower k is <em>not advised</em> unless the dataset is very small (< 50 threats);
-the auto-selection already finds the statistically optimal value.<br><br>
-<b style='color:#f87171'>⚠️ Important:</b>
-A cluster reflects <em>statistical similarity in measurable features</em>, not a confirmed
-real-world campaign. Treat cluster membership as an investigative starting point,
-not a definitive attribution.
-</div>
-""", unsafe_allow_html=True)
-
-    # Check if clustering has been run
-    has_clusters = (
-        "cluster_id" in df.columns
-        and df["cluster_id"].notna().any()
-    )
-
-    if not has_clusters:
-        st.info(
-            "No cluster data found. Re-run the pipeline to generate clusters:\n\n"
-            "```\npython scripts/run_pipeline.py --retrain\n```"
-        )
-    else:
-        cluster_df = df[df["cluster_id"].notna()].copy()
-        cluster_df["cluster_id"] = cluster_df["cluster_id"].astype(int)
-
-        # ── Build per-cluster stats ────────────────────────────────────────
-        cluster_stats = {}
-        for cid in sorted(cluster_df["cluster_id"].unique()):
-            g = cluster_df[cluster_df["cluster_id"] == cid]
-            n_critical = int((g["predicted_priority"] == "Critical").sum()) if "predicted_priority" in g.columns else 0
-            n_high     = int((g["predicted_priority"] == "High").sum())     if "predicted_priority" in g.columns else 0
-            dominant   = g["predicted_priority"].value_counts().index[0]    if "predicted_priority" in g.columns and len(g) > 0 else "—"
-            types_d    = g["threat_type"].value_counts().to_dict()           if "threat_type" in g.columns else {}
-            sources_d  = g["source"].value_counts().to_dict()                if "source"      in g.columns else {}
-            types_str  = ", ".join(f"{t}({c})" for t, c in types_d.items())
-            sources_str= ", ".join(f"{s}({c})" for s, c in sources_d.items())
-            avg_sev    = round(float(g["severity_raw"].mean()), 2)
-            pct_exp    = round(float(g["exploited_flag"].mean()) * 100, 1) if "exploited_flag" in g.columns else 0.0
-            is_notable = avg_sev >= 7.0 or pct_exp >= 20.0 or n_critical >= 3
-
-            cluster_stats[cid] = dict(
-                g=g, n=len(g), avg_sev=avg_sev, pct_exp=pct_exp,
-                dominant=dominant, types_str=types_str, sources_str=sources_str,
-                n_critical=n_critical, n_high=n_high, is_notable=is_notable,
-            )
-
-        # Sort clusters: notable first, then by avg_sev desc
-        sorted_cids = sorted(
-            cluster_stats.keys(),
-            key=lambda c: (not cluster_stats[c]["is_notable"], -cluster_stats[c]["avg_sev"])
-        )
-
-        # ── Visualisation row: donut charts side-by-side ──────────────────
-        st.markdown("#### Priority Distribution per Cluster")
-        donut_cols = st.columns(len(sorted_cids))
-        for col, cid in zip(donut_cols, sorted_cids):
-            cs = cluster_stats[cid]
-            fig = _priority_donut(cs["g"], cid)
-            if fig:
-                col.pyplot(fig, use_container_width=True)
-                plt.close(fig)
-            sev_col = _sev_color(cs["avg_sev"])
-            col.markdown(
-                f"<div style='text-align:center;font-size:0.75rem;color:{sev_col};"
-                f"font-weight:700;margin-top:-8px;'>"
-                f"{_sev_label(cs['avg_sev'])} · {cs['avg_sev']}/10</div>",
-                unsafe_allow_html=True,
-            )
-
-        st.divider()
-
-        # ── Severity bar chart ─────────────────────────────────────────────
-        st.markdown("#### Cluster Size & Severity")
-        fig2, axes = plt.subplots(1, 2, figsize=(11, 3.6))
-        fig2.patch.set_facecolor("#0d0d1a")
-        bar_colors = [_sev_color(cluster_stats[c]["avg_sev"]) for c in sorted_cids]
-        x_labels   = [f"Cluster {c}" for c in sorted_cids]
-        avg_sevs   = [cluster_stats[c]["avg_sev"] for c in sorted_cids]
-        sizes      = [cluster_stats[c]["n"]       for c in sorted_cids]
-
-        for ax, vals, title, ylabel, fmt in [
-            (axes[0], avg_sevs, "Avg Severity per Cluster", "Severity (0–10)", "{:.1f}"),
-            (axes[1], sizes,    "Cluster Size (# Threats)", "# Threats",       "{}"),
-        ]:
-            ax.set_facecolor("#130d2e")
-            bars = ax.bar(x_labels, vals, color=bar_colors, edgecolor="#4a1d96", linewidth=0.8)
-            ax.set_title(title, color="#c084fc", fontsize=10, fontweight="bold")
-            ax.set_ylabel(ylabel, color="#a78bfa", fontsize=8)
-            ax.tick_params(colors="#c4b5fd", labelsize=8)
-            ax.spines[:].set_color("#4a1d96")
-            if ylabel == "Severity (0–10)":
-                ax.set_ylim(0, 10.8)
-            for bar, val in zip(bars, vals):
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + (0.15 if isinstance(val, float) else 1),
-                    fmt.format(val), ha="center", va="bottom",
-                    color="#e9d5ff", fontsize=8, fontweight="bold",
-                )
-        plt.tight_layout()
-        st.pyplot(fig2, use_container_width=True)
-        plt.close(fig2)
-
-        st.divider()
-
-        # ── Clickable cluster cards ────────────────────────────────────────
-        st.markdown("#### Cluster Details")
-        st.caption("Click a cluster card to expand its full analysis, including an NLP-generated analyst summary and member threats.")
-
-        for cid in sorted_cids:
-            cs = cluster_stats[cid]
-            sev_col   = _sev_color(cs["avg_sev"])
-            sev_label = _sev_label(cs["avg_sev"])
-            notable_badge = (
-                "<span style='background:#7f1d1d;color:#fca5a5;border:1px solid #ef4444;"
-                "border-radius:12px;padding:2px 8px;font-size:0.72rem;font-weight:700;"
-                "margin-left:8px;'>⚠ NOTABLE</span>"
-                if cs["is_notable"] else ""
-            )
-            exp_badge = (
-                f"<span style='background:#1c1917;color:#fb923c;border:1px solid #f97316;"
-                f"border-radius:12px;padding:2px 8px;font-size:0.72rem;font-weight:700;"
-                f"margin-left:6px;'>{cs['pct_exp']:.0f}% exploited</span>"
-                if cs["pct_exp"] > 0 else ""
-            )
-
-            card_header = (
-                f"<span style='color:{sev_col};font-weight:800;font-size:1.05rem;'>"
-                f"Cluster {cid}</span>"
-                f"<span style='color:#7c5cbf;font-size:0.88rem;margin-left:10px;'>"
-                f"{cs['n']} threats</span>"
-                f"<span style='background:{sev_col}22;color:{sev_col};border:1px solid {sev_col}55;"
-                f"border-radius:12px;padding:2px 9px;font-size:0.75rem;font-weight:700;"
-                f"margin-left:8px;'>{sev_label} · {cs['avg_sev']}/10</span>"
-                f"{notable_badge}{exp_badge}"
-            )
-
-            with st.expander(f"Cluster {cid}  —  {sev_label} severity · {cs['n']} threats"
-                             + ("  ⚠ NOTABLE" if cs["is_notable"] else ""), expanded=cs["is_notable"]):
-
-                st.markdown(card_header, unsafe_allow_html=True)
-                st.markdown("")
-
-                # Stats row
-                stat_c1, stat_c2, stat_c3, stat_c4 = st.columns(4)
-                stat_c1.metric("Avg Severity", f"{cs['avg_sev']}/10")
-                stat_c2.metric("% Exploited",  f"{cs['pct_exp']:.0f}%")
-                stat_c3.metric("Critical",     cs["n_critical"])
-                stat_c4.metric("High",         cs["n_high"])
-
-                st.markdown("")
-                ic1, ic2 = st.columns(2)
-                ic1.markdown(f"**Threat types:** `{cs['types_str']}`")
-                ic2.markdown(f"**Sources:** `{cs['sources_str']}`")
-                ic1.markdown(f"**Dominant priority:** `{cs['dominant']}`")
-
-                st.divider()
-
-                # NLP analyst summary
-                st.markdown("##### 🧠 Analyst Summary")
-                summary_text = _cluster_nlp_summary(
-                    cid, cs["g"], cs["avg_sev"], cs["pct_exp"],
-                    cs["dominant"], cs["types_str"], cs["sources_str"],
-                    cs["n_critical"], cs["n_high"],
-                )
-                st.markdown(summary_text)
-
-                st.divider()
-
-                # Member threats — hidden by default inside a nested expander
-                with st.expander(f"🔍 View all {cs['n']} member threats", expanded=False):
-                    members = cs["g"].copy()
-                    if "predicted_priority" in members.columns:
-                        members["_rank"] = members["predicted_priority"].map(
-                            {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
-                        ).fillna(0)
-                        members = members.sort_values(
-                            ["_rank", "severity_raw"], ascending=[False, False]
-                        ).drop(columns="_rank")
-
-                    m_cols = ["id", "threat_type", "title", "severity_raw",
-                              "predicted_priority", "exploited_flag", "source", "last_seen"]
-                    m_cols = [c for c in m_cols if c in members.columns]
-                    m_rename = {
-                        "id": "ID", "threat_type": "Type", "title": "Title",
-                        "severity_raw": "Severity", "predicted_priority": "ML Priority",
-                        "exploited_flag": "Exploited", "source": "Source", "last_seen": "Last Seen",
-                    }
-                    m_df = members[m_cols].rename(columns=m_rename)
-                    if "Severity" in m_df.columns:
-                        m_df["Severity"] = m_df["Severity"].round(2)
-                    st.dataframe(m_df, use_container_width=True, hide_index=True)
-
-
-# ══════════════════════════════════════════════
-#  TAB 3 — MITRE ATT&CK  (Phase 3)
-# ══════════════════════════════════════════════
-with tab_mitre:
-
-    st.markdown("### 🧩 MITRE ATT&CK Mappings")
-    st.markdown("""
-<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:10px;
-            padding:14px 18px;margin-bottom:16px;font-size:0.88rem;color:#c4b5fd;'>
-<b style='color:#a855f7'>How mappings are inferred</b><br>
-Mappings are produced by three evidence tiers, applied conservatively:
-<ul style='margin:6px 0 0 0;padding-left:18px;'>
-  <li><b style='color:#86efac'>High confidence</b> — CWE weakness class has a documented,
-      well-established relationship to an ATT&amp;CK technique
-      (e.g. CWE-89 SQL Injection → T1190 Exploit Public-Facing Application).</li>
-  <li><b style='color:#fde68a'>Medium confidence</b> — CVE description text contains specific
-      technical keywords that strongly indicate a technique
-      (e.g. "remote code execution" → T1203).</li>
-  <li><b style='color:#fdba74'>Low confidence</b> — Threat type or IP metadata provides only
-      a broad tactic-level inference (malicious IPs → Reconnaissance / Initial Access).</li>
-</ul>
-<br>
-<b style='color:#f87171'>⚠️ Important limitations:</b>
-These are <em>inferred</em> mappings from limited structured fields, not analyst-verified
-ATT&amp;CK assignments. A single CVE may enable multiple techniques not captured here.
-IP records lack the protocol/payload context needed for precise technique-level mapping.
-Treat all mappings as investigative starting points.
-</div>
-""", unsafe_allow_html=True)
-
-    # Load all mappings from DB
-    from src.pipeline.db import fetch_all_mitre_mappings, fetch_mitre_for_threat
-
-    all_mitre = fetch_all_mitre_mappings()
-
-    if not all_mitre:
-        st.info(
-            "No MITRE mappings found yet. Re-run the pipeline to generate them:\n\n"
-            "```\npython scripts/run_pipeline.py --retrain\n```"
-        )
-    else:
-        mitre_df = pd.DataFrame(all_mitre)
-
-        # ── Summary metrics ────────────────────────────────────────────────
-        total_maps   = len(mitre_df)
-        n_threats    = mitre_df["threat_id"].nunique()
-        n_techniques = mitre_df["technique_id"].nunique()
-        n_tactics    = mitre_df["tactic"].nunique()
-        n_high       = int((mitre_df["confidence"] == "High").sum())
-        n_medium     = int((mitre_df["confidence"] == "Medium").sum())
-        n_low        = int((mitre_df["confidence"] == "Low").sum())
-
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Total Mappings",   f"{total_maps:,}")
-        mc2.metric("Threats Covered",  f"{n_threats:,}")
-        mc3.metric("Unique Techniques",f"{n_techniques:,}")
-        mc4.metric("Unique Tactics",   f"{n_tactics:,}")
-
-        cc1, cc2, cc3 = st.columns(3)
-        cc1.metric("High Confidence",   f"{n_high:,}",   help="CWE-based mappings")
-        cc2.metric("Medium Confidence", f"{n_medium:,}", help="Keyword-based mappings")
-        cc3.metric("Low Confidence",    f"{n_low:,}",    help="Threat-type inference")
-
-        st.divider()
-
-        # ── Tactic distribution chart ──────────────────────────────────────
-        st.markdown("#### Tactic Distribution")
-
-        tactic_counts = (
-            mitre_df.groupby("tactic")
-            .size()
-            .reset_index(name="count")
-            .sort_values("count", ascending=True)
-        )
-
-        TACTIC_COLORS = {
-            "Reconnaissance":        "#7c3aed",
-            "Initial Access":        "#dc2626",
-            "Execution":             "#ea580c",
-            "Persistence":           "#ca8a04",
-            "Privilege Escalation":  "#16a34a",
-            "Defense Evasion":       "#0891b2",
-            "Credential Access":     "#9333ea",
-            "Discovery":             "#2563eb",
-            "Lateral Movement":      "#db2777",
-            "Collection":            "#059669",
-            "Command and Control":   "#d97706",
-            "Exfiltration":          "#be123c",
-            "Impact":                "#b45309",
-        }
-
-        bar_colors = [
-            TACTIC_COLORS.get(t, "#6d28d9")
-            for t in tactic_counts["tactic"].tolist()
-        ]
-
-        fig_t, ax_t = plt.subplots(figsize=(10, max(3, len(tactic_counts) * 0.55)))
-        fig_t.patch.set_facecolor("#0d0d1a")
-        ax_t.set_facecolor("#130d2e")
-        bars = ax_t.barh(
-            tactic_counts["tactic"], tactic_counts["count"],
-            color=bar_colors, edgecolor="#4a1d96", linewidth=0.6,
-        )
-        ax_t.set_xlabel("Number of Mappings", color="#a78bfa", fontsize=9)
-        ax_t.set_title("ATT&CK Tactic Coverage", color="#c084fc",
-                        fontsize=11, fontweight="bold")
-        ax_t.tick_params(colors="#c4b5fd", labelsize=8)
-        ax_t.spines[:].set_color("#4a1d96")
-        for bar, val in zip(bars, tactic_counts["count"].tolist()):
-            ax_t.text(val + 0.3, bar.get_y() + bar.get_height() / 2,
-                      str(val), va="center", color="#e9d5ff", fontsize=8)
-        plt.tight_layout()
-        st.pyplot(fig_t, use_container_width=True)
-        plt.close(fig_t)
-
-        st.divider()
-
-        # ── Top techniques table ───────────────────────────────────────────
-        st.markdown("#### Most Common Techniques")
-
-        tech_summary = (
-            mitre_df.groupby(["technique_id", "technique_name", "tactic"])
-            .agg(
-                count=("threat_id", "count"),
-                high=("confidence", lambda x: (x == "High").sum()),
-                medium=("confidence", lambda x: (x == "Medium").sum()),
-                low=("confidence", lambda x: (x == "Low").sum()),
-            )
-            .reset_index()
-            .sort_values("count", ascending=False)
-            .head(15)
-        )
-        tech_summary.columns = [
-            "Technique ID", "Technique Name", "Tactic",
-            "# Threats", "High", "Medium", "Low"
-        ]
-        st.dataframe(tech_summary, use_container_width=True, hide_index=True)
-
-        st.divider()
-
-        # ── Per-threat MITRE lookup ────────────────────────────────────────
-        st.markdown("#### Inspect Mappings for a Threat")
-
-        # Only show threats that have at least one mapping
-        mapped_ids = sorted(mitre_df["threat_id"].unique().tolist())
-        if not mapped_ids:
-            st.info("No mapped threats found.")
-        else:
-            selected_mitre_id = st.selectbox(
-                "Select a threat ID",
-                options=mapped_ids,
-                format_func=lambda x: f"{x[:70]}..." if len(str(x)) > 70 else x,
-                key="mitre_threat_select",
-            )
-            threat_mappings = fetch_mitre_for_threat(selected_mitre_id)
-
-            if not threat_mappings:
-                st.info("No MITRE mappings available for this threat.")
-            else:
-                CONF_COLORS = {
-                    "High":   ("#052e16", "#86efac", "#166534"),   # bg, text, border
-                    "Medium": ("#3b2509", "#fde68a", "#92400e"),
-                    "Low":    ("#431407", "#fdba74", "#9a3412"),
-                }
-
-                # Show threat context from main df
-                threat_row = df[df["id"] == selected_mitre_id]
-                if not threat_row.empty:
-                    tr = threat_row.iloc[0]
-                    pv = tr.get("predicted_priority", "—")
-                    pc = {"Critical": "#fda4af", "High": "#fdba74",
-                          "Medium": "#fde68a", "Low": "#86efac"}.get(pv, "#c4b5fd")
+            # AI Summary (collapsible)
+            ai_sum = str(row.get("ai_summary") or "")
+            if ai_sum and ai_sum not in ("None", "nan"):
+                with st.expander("🧠 Analyst Summary", expanded=False):
+                    sections = [s.strip() for s in ai_sum.split("\n\n") if s.strip()]
+                    for sec in sections:
+                        header = ""
+                        if sec.startswith("**"):
+                            end = sec.find("**", 2)
+                            if end > 2:
+                                header = sec[2:end].rstrip(":")
+                        is_rec = "recommendation" in header.lower()
+                        bc = "#f0fdf4" if is_rec else "#fcfcfc"
+                        hc = "#166534" if is_rec else "#043f2e"
+                        body = (
+                            sec
+                            .replace(f"**{header}:**\n", "")
+                            .replace(f"**{header}:**", "")
+                            .replace("\n- ", "<br>• ")
+                            .replace("\n", "<br>")
+                        )
+                        body = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body)
+                        st.markdown(
+                            f"<div style='background:{bc};border-left:3px solid {'#16a34a' if is_rec else '#c8f169'};"
+                            f"border-radius:6px;padding:10px 14px;margin-bottom:8px;'>"
+                            f"<div style='font-size:11px;font-weight:700;text-transform:uppercase;"
+                            f"letter-spacing:0.06em;color:{hc};margin-bottom:4px;'>{header}</div>"
+                            f"<div style='font-size:0.85rem;color:#242423;line-height:1.6;'>{body}</div>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+            # MITRE mappings (collapsible)
+            mitre_maps = fetch_mitre_for_threat(tid)
+            if mitre_maps:
+                with st.expander(f"🧩 MITRE ATT&CK  ({len(mitre_maps)} technique{'s' if len(mitre_maps)>1 else ''})", expanded=False):
+                    CONF_C = {"High": "#16a34a", "Medium": "#ca8a04", "Low": "#6b7c6a"}
+                    for m in mitre_maps:
+                        conf    = m.get("confidence", "Low")
+                        tact    = m.get("tactic", "")
+                        tech_id = m.get("technique_id", "")
+                        tech_nm = m.get("technique_name", "")
+                        basis   = m.get("basis", "")
+                        url     = f"https://attack.mitre.org/techniques/{tech_id.replace('.', '/')}"
+                        cc      = CONF_C.get(conf, "#6b7c6a")
+                        st.markdown(
+                            f"<div style='border:1px solid #e8edd9;border-radius:8px;"
+                            f"padding:10px 14px;margin-bottom:6px;'>"
+                            f"<div style='display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;'>"
+                            f"<div><span style='font-size:11px;font-weight:700;color:{cc};"
+                            f"text-transform:uppercase;letter-spacing:0.06em;'>{conf}</span>"
+                            f"&nbsp;&nbsp;<strong style='color:#043f2e;'>{tech_id}</strong>"
+                            f" — {tech_nm}"
+                            f"<div style='font-size:0.75rem;color:#6b7c6a;margin-top:2px;'>"
+                            f"Tactic: {tact}</div></div>"
+                            f"<a href='{url}' target='_blank' style='font-size:11px;color:#043f2e;"
+                            f"border:1px solid #043f2e;border-radius:4px;padding:3px 8px;"
+                            f"text-decoration:none;white-space:nowrap;font-weight:500;'>"
+                            f"ATT&CK ↗</a></div>"
+                            f"<div style='font-size:0.75rem;color:#6b7c6a;margin-top:6px;"
+                            f"padding-top:6px;border-top:1px solid #f0f0f0;'>{basis[:100]}</div>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+            # Analyst feedback (collapsible)
+            with st.expander("✍️ Analyst Feedback", expanded=False):
+                existing_fb = _fetch_feedback(tid)
+                curr_lbl    = existing_fb.get("analyst_label") if existing_fb else None
+                curr_notes  = existing_fb.get("feedback_notes") if existing_fb else ""
+
+                if curr_lbl:
                     st.markdown(
-                        f"<div style='background:#1e0a4a;border:1px solid #6d28d9;"
-                        f"border-radius:10px;padding:12px 16px;margin-bottom:12px;'>"
-                        f"<span style='color:#e9d5ff;font-weight:700;'>{tr['title']}</span>"
-                        f"&nbsp;&nbsp;<span style='color:{pc};font-size:0.82rem;"
-                        f"font-weight:600;'>Priority: {pv}</span>"
-                        f"&nbsp;&nbsp;<span style='color:#7c5cbf;font-size:0.8rem;'>"
-                        f"Severity: {tr['severity_raw']}/10 · Source: {tr['source']}</span>"
+                        f"<div style='background:#f0fdf4;border-left:3px solid #16a34a;"
+                        f"border-radius:6px;padding:8px 12px;margin-bottom:10px;"
+                        f"font-size:0.85rem;color:#166534;'>"
+                        f"✓ Current label: <strong>{curr_lbl.replace('_',' ')}</strong>"
+                        f"{'  ·  ' + curr_notes if curr_notes else ''}"
                         f"</div>",
                         unsafe_allow_html=True,
                     )
 
+                fb_key = f"fb_{tid[:20]}"
+                sel_lbl = st.selectbox(
+                    "Assign label",
+                    options=["— no change —"] + list(_ANALYST_LABEL_OPTIONS),
+                    index=0,
+                    key=f"sel_{fb_key}",
+                )
+                notes = st.text_input("Notes (optional)", value=curr_notes or "", key=f"notes_{fb_key}")
+                if st.button("Save Feedback", key=f"save_{fb_key}") and sel_lbl != "— no change —":
+                    _upsert_feedback(tid, sel_lbl, notes, "analyst")
+                    st.success("Feedback saved.")
+                    st.rerun()
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAB 3 — CLUSTERS
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_clusters:
+
+    def _cluster_nlp_summary(g, avg_sev, pct_exp, dominant, types_str, sources_str, n_critical, n_high):
+        n = len(g)
+        has_cve = "cve" in types_str
+        has_ip  = "malicious_ip" in types_str
+        kind = ("CVEs and malicious IPs" if has_cve and has_ip
+                else "CVE vulnerabilities" if has_cve
+                else "malicious IP addresses")
+        lines = [f"**What:** {n} {kind} sharing a similar profile across severity, exploitation, recency, and source."]
+        reasons = []
+        if avg_sev >= 8.5:   reasons.append(f"uniformly very high severity ({avg_sev:.1f}/10)")
+        elif avg_sev >= 6.5: reasons.append(f"elevated severity ({avg_sev:.1f}/10)")
+        else:                reasons.append(f"moderate–low severity ({avg_sev:.1f}/10)")
+        if pct_exp >= 80:    reasons.append(f"nearly all exploited ({pct_exp:.0f}%)")
+        elif pct_exp >= 20:  reasons.append(f"{pct_exp:.0f}% carry exploitation evidence")
+        else:                reasons.append("no exploitation evidence found")
+        if "abuseipdb" in sources_str and "nvd" not in sources_str:
+            reasons.append("all from AbuseIPDB — community-reported abuse")
+        elif "nvd" in sources_str and "abuseipdb" not in sources_str:
+            reasons.append("all from NVD — formally catalogued vulnerabilities")
+        lines.append("**Why grouped:** " + "; ".join(reasons) + ".")
+        if avg_sev >= 9.0:   verdict = "CRITICAL — immediate analyst attention required."
+        elif avg_sev >= 7.0: verdict = "HIGH — prompt review recommended."
+        elif avg_sev >= 4.5: verdict = "MEDIUM — standard patching cycle."
+        else:                verdict = "LOW — routine monitoring."
+        lines.append(f"**Severity verdict:** {verdict}")
+        if n_critical or n_high:
+            lines.append(f"**Priority breakdown:** {n_critical} Critical · {n_high} High · {n - n_critical - n_high} Medium/Low")
+        return "\n\n".join(lines)
+
+    st.markdown("<span class='eyebrow'>Threat Clusters</span>", unsafe_allow_html=True)
+    st.markdown("""
+<div style='background:#fcfcfc;border-radius:12px;padding:14px 18px;
+            border:1px solid #e8edd9;margin-bottom:20px;font-size:0.85rem;color:#6b7c6a;'>
+<strong style='color:#043f2e;'>How it works:</strong>
+K-Means clustering on 7 features (severity, exploitation, recency, report count, source reliability, is_cve, is_malicious_ip)
++ TF-IDF text signal (30% weight). K auto-selected by silhouette score (k=3–8).
+A cluster reflects <em>statistical similarity</em>, not a confirmed campaign.
+</div>
+""", unsafe_allow_html=True)
+
+    has_clusters = "cluster_id" in df.columns and df["cluster_id"].notna().any()
+    if not has_clusters:
+        st.info("No cluster data. Re-run: `python scripts/run_pipeline.py --retrain`")
+    else:
+        cluster_df = df[df["cluster_id"].notna()].copy()
+        cluster_df["cluster_id"] = cluster_df["cluster_id"].astype(int)
+
+        cluster_stats = {}
+        for cid in sorted(cluster_df["cluster_id"].unique()):
+            g = cluster_df[cluster_df["cluster_id"] == cid]
+            n_crit = int((g["predicted_priority"] == "Critical").sum()) if "predicted_priority" in g.columns else 0
+            n_hi   = int((g["predicted_priority"] == "High").sum())     if "predicted_priority" in g.columns else 0
+            dom    = g["predicted_priority"].value_counts().index[0]    if "predicted_priority" in g.columns and len(g) > 0 else "—"
+            types_d  = g["threat_type"].value_counts().to_dict()  if "threat_type" in g.columns else {}
+            sources_d= g["source"].value_counts().to_dict()        if "source"      in g.columns else {}
+            types_s  = ", ".join(f"{t}({c})" for t, c in types_d.items())
+            srcs_s   = ", ".join(f"{s}({c})" for s, c in sources_d.items())
+            avg_sev  = round(float(g["severity_raw"].mean()), 2)
+            pct_exp  = round(float(g["exploited_flag"].fillna(0).mean()) * 100, 1)
+            notable  = avg_sev >= 7.0 or pct_exp >= 20.0 or n_crit >= 3
+            cluster_stats[cid] = dict(g=g, n=len(g), avg_sev=avg_sev, pct_exp=pct_exp,
+                                       types_str=types_s, sources_str=srcs_s,
+                                       n_critical=n_crit, n_high=n_hi,
+                                       dominant=dom, notable=notable)
+
+        sorted_cids = sorted(cluster_stats, key=lambda c: (not cluster_stats[c]["notable"], -cluster_stats[c]["avg_sev"]))
+
+        # Donut row
+        donut_cols = st.columns(len(sorted_cids))
+        for col, cid in zip(donut_cols, sorted_cids):
+            cs = cluster_stats[cid]
+            fig_dn, ax_dn = plt.subplots(figsize=(2.5, 2.5))
+            fig_dn.patch.set_facecolor("#eef2e3")
+            ax_dn.set_facecolor("#eef2e3")
+            p_counts = cs["g"]["predicted_priority"].value_counts() if "predicted_priority" in cs["g"].columns else {}
+            lo = ["Critical","High","Medium","Low"]
+            cm = {"Critical":"#dc2626","High":"#ea580c","Medium":"#ca8a04","Low":"#16a34a"}
+            pres = [(l, int(p_counts.get(l,0))) for l in lo if p_counts.get(l,0) > 0]
+            if pres:
+                lv, vv = zip(*pres)
+                cv = [cm[l] for l in lv]
+                ax_dn.pie(vv, colors=cv, startangle=90, counterclock=False,
+                           wedgeprops={"width":0.5,"edgecolor":"#eef2e3","linewidth":2})
+            ax_dn.text(0, 0, str(cs["n"]), ha="center", va="center",
+                       fontsize=12, fontweight="600", color="#043f2e")
+            ax_dn.set_title(f"C{cid}", color="#043f2e", fontsize=9, fontweight="600", pad=3)
+            plt.tight_layout(pad=0.2)
+            col.pyplot(fig_dn, use_container_width=True)
+            plt.close(fig_dn)
+            sv_lbl = "CRITICAL" if cs["avg_sev"]>=9 else "HIGH" if cs["avg_sev"]>=7 else "MEDIUM" if cs["avg_sev"]>=4.5 else "LOW"
+            sv_col = "#dc2626" if sv_lbl=="CRITICAL" else "#ea580c" if sv_lbl=="HIGH" else "#ca8a04" if sv_lbl=="MEDIUM" else "#16a34a"
+            col.markdown(f"<div style='text-align:center;font-size:10px;font-weight:700;color:{sv_col};margin-top:-8px;'>{sv_lbl} · {cs['avg_sev']}/10</div>", unsafe_allow_html=True)
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+        for cid in sorted_cids:
+            cs = cluster_stats[cid]
+            sv_lbl = "CRITICAL" if cs["avg_sev"]>=9 else "HIGH" if cs["avg_sev"]>=7 else "MEDIUM" if cs["avg_sev"]>=4.5 else "LOW"
+            notable_tag = "  ⚠ NOTABLE" if cs["notable"] else ""
+            with st.expander(
+                f"Cluster {cid}  ·  {sv_lbl}  ·  {cs['n']} threats{notable_tag}",
+                expanded=cs["notable"],
+            ):
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("Avg Severity", f"{cs['avg_sev']}/10")
+                s2.metric("% Exploited",  f"{cs['pct_exp']:.0f}%")
+                s3.metric("Critical",     cs["n_critical"])
+                s4.metric("High",         cs["n_high"])
+                ic1, ic2 = st.columns(2)
+                ic1.markdown(f"**Types:** `{cs['types_str']}`")
+                ic2.markdown(f"**Sources:** `{cs['sources_str']}`")
+                st.divider()
+                st.markdown("**Analyst Summary**")
+                summary_text = _cluster_nlp_summary(
+                    cs["g"], cs["avg_sev"], cs["pct_exp"],
+                    cs["dominant"], cs["types_str"], cs["sources_str"],
+                    cs["n_critical"], cs["n_high"],
+                )
+                for line in summary_text.split("\n\n"):
+                    hdr = ""
+                    if line.startswith("**"):
+                        e = line.find("**", 2)
+                        if e > 2:
+                            hdr = line[2:e]
+                    body = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>",
+                                  line.replace(f"**{hdr}:**", "").replace(f"**{hdr}**", "").strip())
+                    st.markdown(
+                        f"<div style='background:#eef2e3;border-left:3px solid #c8f169;"
+                        f"border-radius:6px;padding:8px 12px;margin-bottom:6px;"
+                        f"font-size:0.85rem;color:#043f2e;'>"
+                        f"{'<strong>' + hdr + ':</strong> ' if hdr else ''}{body}</div>",
+                        unsafe_allow_html=True,
+                    )
+                with st.expander(f"View {cs['n']} member threats", expanded=False):
+                    members = cs["g"].copy()
+                    if "predicted_priority" in members.columns:
+                        members["_r"] = members["predicted_priority"].map(PRIORITY_RANK).fillna(0)
+                        members = members.sort_values(["_r","severity_raw"], ascending=[False,False]).drop(columns="_r")
+                    mc = ["id","threat_type","title","severity_raw","predicted_priority","exploited_flag","source","last_seen"]
+                    mc = [c for c in mc if c in members.columns]
+                    mr = {"id":"ID","threat_type":"Type","title":"Title","severity_raw":"Severity",
+                          "predicted_priority":"Priority","exploited_flag":"Exploited","source":"Source","last_seen":"Last Seen"}
+                    mdf = members[mc].rename(columns=mr)
+                    if "Severity" in mdf.columns:
+                        mdf["Severity"] = mdf["Severity"].round(2)
+                    st.dataframe(mdf, use_container_width=True, hide_index=True)
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAB 4 — MITRE ATT&CK
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_mitre:
+    st.markdown("<span class='eyebrow'>MITRE ATT&CK Mappings</span>", unsafe_allow_html=True)
+    st.markdown("""
+<div style='background:#fcfcfc;border-radius:12px;padding:14px 18px;border:1px solid #e8edd9;
+            margin-bottom:20px;font-size:0.85rem;color:#6b7c6a;'>
+<strong style='color:#043f2e;'>Confidence tiers:</strong>
+<span style='color:#16a34a;font-weight:600;'>High</span> = CWE-documented relationship ·
+<span style='color:#ca8a04;font-weight:600;'>Medium</span> = keyword inference ·
+<span style='color:#6b7c6a;font-weight:600;'>Low</span> = threat-type inference.
+Mappings are investigative starting points — not analyst-verified ATT&CK assignments.
+</div>
+""", unsafe_allow_html=True)
+
+    all_mitre = fetch_all_mitre_mappings()
+    if not all_mitre:
+        st.info("No MITRE mappings found. Re-run: `python scripts/run_pipeline.py --retrain`")
+    else:
+        mdf = pd.DataFrame(all_mitre)
+        n_high_m  = int((mdf["confidence"] == "High").sum())
+        n_med_m   = int((mdf["confidence"] == "Medium").sum())
+        n_low_m   = int((mdf["confidence"] == "Low").sum())
+
+        mm1, mm2, mm3, mm4 = st.columns(4)
+        mm1.metric("Total Mappings",    len(mdf))
+        mm2.metric("Threats Covered",   mdf["threat_id"].nunique())
+        mm3.metric("Unique Techniques", mdf["technique_id"].nunique())
+        mm4.metric("High Confidence",   n_high_m)
+
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+        mc1, mc2 = st.columns([3, 2], gap="large")
+        with mc1:
+            st.markdown("<span class='eyebrow'>Tactic Distribution</span>", unsafe_allow_html=True)
+            tactic_counts = mdf.groupby("tactic").size().reset_index(name="count").sort_values("count", ascending=True)
+            TACTIC_COLORS_M = {
+                "Reconnaissance":"#043f2e","Initial Access":"#dc2626","Execution":"#ea580c",
+                "Persistence":"#ca8a04","Privilege Escalation":"#16a34a","Defense Evasion":"#0891b2",
+                "Credential Access":"#9333ea","Discovery":"#2563eb","Lateral Movement":"#db2777",
+                "Collection":"#059669","Command and Control":"#d97706","Exfiltration":"#be123c","Impact":"#b45309",
+            }
+            bar_cols_m = [TACTIC_COLORS_M.get(t, "#043f2e") for t in tactic_counts["tactic"]]
+            fig_t, ax_t = plt.subplots(figsize=(7, max(3, len(tactic_counts) * 0.5)))
+            fig_t.patch.set_facecolor("#eef2e3")
+            ax_t.set_facecolor("#fcfcfc")
+            bars_t = ax_t.barh(tactic_counts["tactic"], tactic_counts["count"],
+                                color=bar_cols_m, edgecolor="#e8edd9", linewidth=0.6)
+            ax_t.set_xlabel("Mappings", color="#6b7c6a", fontsize=8)
+            ax_t.set_title("ATT&CK Tactic Coverage", color="#043f2e", fontsize=10, fontweight="600")
+            ax_t.tick_params(colors="#6b7c6a", labelsize=8)
+            ax_t.spines[:].set_color("#e8edd9")
+            for bar, val in zip(bars_t, tactic_counts["count"]):
+                ax_t.text(val + 0.3, bar.get_y() + bar.get_height()/2, str(val),
+                           va="center", color="#043f2e", fontsize=7.5)
+            plt.tight_layout()
+            st.pyplot(fig_t, use_container_width=True)
+            plt.close(fig_t)
+
+        with mc2:
+            st.markdown("<span class='eyebrow'>Top Techniques</span>", unsafe_allow_html=True)
+            tech_top = (mdf.groupby(["technique_id","technique_name"])
+                        .size().reset_index(name="count")
+                        .sort_values("count", ascending=False).head(8))
+            for _, tr in tech_top.iterrows():
                 st.markdown(
-                    f"**{len(threat_mappings)} MITRE ATT&CK technique(s) inferred** "
-                    f"for this threat:"
+                    f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                    f"padding:7px 0;border-bottom:1px solid #e8edd9;'>"
+                    f"<div><div style='font-size:0.82rem;font-weight:500;color:#043f2e;'>"
+                    f"{tr['technique_id']}</div>"
+                    f"<div style='font-size:0.75rem;color:#6b7c6a;'>{str(tr['technique_name'])[:35]}</div></div>"
+                    f"<span class='pill pill-chartreuse'>{tr['count']}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
                 )
 
-                for m in threat_mappings:
-                    conf = m.get("confidence", "Low")
-                    bg, fg, border = CONF_COLORS.get(conf, CONF_COLORS["Low"])
-                    mitre_url = (
-                        f"https://attack.mitre.org/techniques/"
-                        f"{m['technique_id'].replace('.', '/')}"
-                    )
+        st.divider()
+        st.markdown("<span class='eyebrow'>Per-Threat Lookup</span>", unsafe_allow_html=True)
+        mapped_ids = sorted(mdf["threat_id"].unique().tolist())
+        sel_mitre = st.selectbox("Select a threat ID",
+                                  options=mapped_ids,
+                                  format_func=lambda x: f"{x[:65]}..." if len(str(x)) > 65 else x,
+                                  key="mitre_select")
+        if sel_mitre:
+            t_maps = fetch_mitre_for_threat(sel_mitre)
+            t_row  = df[df["id"] == sel_mitre]
+            if not t_row.empty:
+                tr = t_row.iloc[0]
+                pv = tr.get("predicted_priority","—")
+                pc = P_COLOR.get(pv, "#043f2e")
+                p_bg_val = P_BG.get(pv, "#fcfcfc")
+                st.markdown(
+                    f"<div style='background:#fcfcfc;border-radius:10px;padding:12px 16px;"
+                    f"border:1px solid #e8edd9;margin-bottom:12px;display:flex;"
+                    f"align-items:center;gap:12px;flex-wrap:wrap;'>"
+                    f"<span style='font-weight:600;color:#043f2e;'>{tr['title']}</span>"
+                    f"<span class='pill' style='background:{p_bg_val};color:{pc};border:1px solid {pc}44;'>{pv}</span>"
+                    f"<span style='color:#6b7c6a;font-size:0.82rem;'>Severity {tr['severity_raw']}/10 · {tr['source']}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            CONF_C2 = {"High":"#16a34a","Medium":"#ca8a04","Low":"#6b7c6a"}
+            for m in t_maps:
+                conf  = m.get("confidence","Low")
+                cc    = CONF_C2.get(conf, "#6b7c6a")
+                t_id  = m.get("technique_id","")
+                t_nm  = m.get("technique_name","")
+                tact  = m.get("tactic","")
+                basis = m.get("basis","")
+                url   = f"https://attack.mitre.org/techniques/{t_id.replace('.','/')}"
+                st.markdown(
+                    f"<div style='background:#fcfcfc;border:1px solid #e8edd9;"
+                    f"border-left:4px solid {cc};border-radius:8px;"
+                    f"padding:12px 16px;margin-bottom:8px;'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;'>"
+                    f"<div><span style='font-size:10px;font-weight:700;color:{cc};"
+                    f"text-transform:uppercase;letter-spacing:0.06em;'>{conf}</span>"
+                    f"&nbsp;&nbsp;<strong style='color:#043f2e;'>{t_id}</strong> — {t_nm}"
+                    f"<div style='font-size:0.75rem;color:#6b7c6a;margin-top:3px;'>Tactic: {tact}</div></div>"
+                    f"<a href='{url}' target='_blank' style='font-size:11px;color:#043f2e;"
+                    f"border:1px solid #043f2e;border-radius:4px;padding:3px 10px;"
+                    f"text-decoration:none;font-weight:500;white-space:nowrap;'>ATT&CK ↗</a>"
+                    f"</div>"
+                    f"<div style='font-size:0.75rem;color:#6b7c6a;margin-top:7px;"
+                    f"padding-top:7px;border-top:1px solid #f0f0f0;'>{basis[:120]}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAB 5 — MONITORING
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_monitor:
+    st.markdown("<span class='eyebrow'>Continuous Monitoring</span>", unsafe_allow_html=True)
+    runs_all = fetch_pipeline_runs(limit=50)
+    hist_all = fetch_threat_history(limit=500)
+    runs_df2 = pd.DataFrame(runs_all)  if runs_all  else pd.DataFrame()
+    hist_df2 = pd.DataFrame(hist_all)  if hist_all  else pd.DataFrame()
+
+    if not runs_df2.empty:
+        lat = runs_df2.iloc[0]
+        pm1, pm2, pm3, pm4, pm5 = st.columns(5)
+        pm1.metric("Total Runs",     len(runs_df2))
+        pm2.metric("Latest New",     int(lat.get("new_threats",     0)))
+        pm3.metric("Latest Changed", int(lat.get("updated_threats", 0)))
+        pm4.metric("Total Threats",  int(lat.get("total_threats",   0)))
+        pm5.metric("Last Duration",  f"{lat.get('duration_secs',0):.1f}s")
+
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+        mon_l, mon_r = st.columns([3, 2], gap="large")
+        with mon_l:
+            # Run history
+            st.markdown("<span class='eyebrow'>Run History</span>", unsafe_allow_html=True)
+            run_disp = runs_df2[
+                [c for c in ["run_id","run_at","mode","total_threats","new_threats",
+                              "updated_threats","n_critical","n_high","duration_secs","notes"]
+                 if c in runs_df2.columns]
+            ].copy()
+            rn = {"run_id":"Run #","run_at":"Timestamp","mode":"Mode","total_threats":"Total",
+                  "new_threats":"New","updated_threats":"Changed","n_critical":"Critical",
+                  "n_high":"High","duration_secs":"Duration (s)","notes":"Notes"}
+            run_disp = run_disp.rename(columns=rn)
+            if "Timestamp" in run_disp.columns:
+                run_disp["Timestamp"] = run_disp["Timestamp"].str[:19].str.replace("T"," ")
+            if "Duration (s)" in run_disp.columns:
+                run_disp["Duration (s)"] = run_disp["Duration (s)"].round(1)
+            st.dataframe(run_disp, use_container_width=True, hide_index=True)
+
+            # Bar chart
+            if len(runs_df2) >= 2 and "new_threats" in runs_df2.columns:
+                st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+                st.markdown("<span class='eyebrow'>New & Changed per Run</span>", unsafe_allow_html=True)
+                plot_r = runs_df2.sort_values("run_id").tail(15)
+                xlbls  = [f"Run {int(r)}" for r in plot_r["run_id"]]
+                new_v  = plot_r["new_threats"].fillna(0).astype(int).tolist()
+                chg_v  = plot_r["updated_threats"].fillna(0).astype(int).tolist()
+                xp = range(len(xlbls))
+                w  = 0.4
+                fig_r, ax_r = plt.subplots(figsize=(min(9, len(xlbls)+2), 3.2))
+                fig_r.patch.set_facecolor("#eef2e3")
+                ax_r.set_facecolor("#fcfcfc")
+                ax_r.bar([x-w/2 for x in xp], new_v, width=w, color="#043f2e", label="New")
+                ax_r.bar([x+w/2 for x in xp], chg_v, width=w, color="#c8f169", label="Changed")
+                ax_r.set_xticks(list(xp)); ax_r.set_xticklabels(xlbls, rotation=25, ha="right", fontsize=8, color="#043f2e")
+                ax_r.tick_params(colors="#6b7c6a", labelsize=8)
+                ax_r.spines[:].set_color("#e8edd9")
+                ax_r.set_facecolor("#fcfcfc"); fig_r.patch.set_facecolor("#eef2e3")
+                ax_r.legend(frameon=False, fontsize=8, labelcolor="#043f2e")
+                plt.tight_layout()
+                st.pyplot(fig_r, use_container_width=True)
+                plt.close(fig_r)
+
+        with mon_r:
+            st.markdown("<span class='eyebrow'>Activity Feed</span>", unsafe_allow_html=True)
+            if not hist_df2.empty:
+                fc_opt = st.multiselect("Filter", ["new","escalated","reduced"],
+                                         default=["new","escalated","reduced"], key="mon_filter")
+                feed = hist_df2[hist_df2["change_type"].isin(fc_opt)].head(40)
+                DOT2 = {"new":"dot-new","escalated":"dot-escalate","reduced":"dot-reduced"}
+                CHANGE_LABEL = {"new":"🟢 NEW","escalated":"🔴 ESCALATED","reduced":"🔵 REDUCED"}
+                for _, ev in feed.iterrows():
+                    ct   = ev.get("change_type","")
+                    dotc = DOT2.get(ct,"dot-new")
+                    tid2 = str(ev.get("threat_id",""))[:30]
+                    prev = ev.get("previous_priority") or "—"
+                    newp = ev.get("new_priority") or "—"
+                    ts   = str(ev.get("run_at",""))[:16].replace("T"," ")
+                    clbl = CHANGE_LABEL.get(ct, ct)
+                    arrow = f"{prev} → {newp}" if ct != "new" else f"Priority: {newp}"
                     st.markdown(
-                        f"""
-<div style='background:{bg};border:1px solid {border};border-left:4px solid {border};
-            border-radius:10px;padding:14px 18px;margin-bottom:10px;'>
-  <div style='display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap;'>
-    <div style='flex:1;min-width:200px;'>
-      <div style='color:{fg};font-size:0.82rem;font-weight:700;
-                  letter-spacing:0.5px;margin-bottom:4px;'>
-        {conf.upper()} CONFIDENCE
-      </div>
-      <div style='color:#e9d5ff;font-weight:700;font-size:1rem;'>
-        {m['technique_id']} — {m['technique_name']}
-      </div>
-      <div style='color:#a78bfa;font-size:0.84rem;margin-top:2px;'>
-        Tactic: <b>{m['tactic']}</b>
-      </div>
-    </div>
-    <div>
-      <a href='{mitre_url}' target='_blank'
-         style='background:#2d1066;color:#c084fc;border:1px solid #6d28d9;
-                border-radius:6px;padding:4px 12px;font-size:0.78rem;
-                text-decoration:none;font-weight:600;'>
-        View on ATT&CK ↗
-      </a>
-    </div>
-  </div>
-  <div style='color:#9f7aea;font-size:0.82rem;margin-top:8px;
-              border-top:1px solid {border};padding-top:8px;'>
-    <b>Basis:</b> {m.get('basis', '—')}
-  </div>
-</div>""",
+                        f"<div style='display:flex;gap:8px;padding:7px 0;"
+                        f"border-bottom:1px solid #e8edd9;align-items:flex-start;'>"
+                        f"<span class='{dotc}' style='margin-top:5px;flex-shrink:0;'></span>"
+                        f"<div><div style='font-size:0.8rem;font-weight:500;color:#043f2e;'>{tid2}</div>"
+                        f"<div style='font-size:0.73rem;color:#6b7c6a;'>{arrow} · {ts}</div></div>"
+                        f"</div>",
                         unsafe_allow_html=True,
                     )
 
-
-# ══════════════════════════════════════════════
-#  TAB 4 — MONITORING  (Phase 4)
-# ══════════════════════════════════════════════
-with tab_monitor:
-    from src.pipeline.db import (
-        fetch_pipeline_runs,
-        fetch_threat_history,
-        fetch_threat_history_for_id,
-    )
-
-    st.markdown("### 📡 Continuous Monitoring")
-    st.markdown("""
-<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:10px;
-            padding:14px 18px;margin-bottom:16px;font-size:0.88rem;color:#c4b5fd;'>
-<b style='color:#a855f7'>How monitoring works</b><br>
-Every pipeline run snapshots the current priority of each threat before and after
-re-scoring. New threats, escalations (priority went up) and reductions (priority
-went down) are recorded in a persistent audit log. This tab lets analysts track
-how the threat landscape changes across runs without manual database inspection.
-<br><br>
-To simulate a new run: <code>python scripts/run_pipeline.py --retrain</code>
-or <code>--synthetic</code> / <code>--live</code>.
-</div>
-""", unsafe_allow_html=True)
-
-    runs     = fetch_pipeline_runs(limit=50)
-    history  = fetch_threat_history(limit=1000)
-    runs_df  = pd.DataFrame(runs)    if runs    else pd.DataFrame()
-    hist_df  = pd.DataFrame(history) if history else pd.DataFrame()
-
-    has_runs    = not runs_df.empty
-    has_history = not hist_df.empty
-
-    # ── Top-level run metrics ──────────────────────────────────────────────
-    if has_runs:
-        latest = runs_df.iloc[0]   # newest run first
-        rm1, rm2, rm3, rm4, rm5 = st.columns(5)
-        rm1.metric("Total Runs",      len(runs_df))
-        rm2.metric("Latest New",      int(latest.get("new_threats",     0)))
-        rm3.metric("Latest Escalated",int(latest.get("updated_threats", 0)))
-        rm4.metric("Total Threats",   int(latest.get("total_threats",   0)))
-        rm5.metric("Last Duration",   f"{latest.get('duration_secs', 0):.1f}s")
-    else:
-        st.info(
-            "No pipeline run history yet. Run the pipeline to start collecting monitoring data:\n\n"
-            "```\npython scripts/run_pipeline.py --retrain\n```"
-        )
-
-    if has_runs:
-        st.divider()
-
-        # ── Run history table ──────────────────────────────────────────────
-        st.markdown("#### Pipeline Run History")
-
-        run_display = runs_df[[
-            c for c in [
-                "run_id", "run_at", "mode", "total_threats",
-                "new_threats", "updated_threats", "unchanged_threats",
-                "n_critical", "n_high", "n_medium", "n_low",
-                "duration_secs", "notes",
-            ] if c in runs_df.columns
-        ]].copy()
-
-        run_rename = {
-            "run_id": "Run #", "run_at": "Timestamp", "mode": "Mode",
-            "total_threats": "Total", "new_threats": "New",
-            "updated_threats": "Changed", "unchanged_threats": "Unchanged",
-            "n_critical": "Critical", "n_high": "High",
-            "n_medium": "Medium", "n_low": "Low",
-            "duration_secs": "Duration (s)", "notes": "Notes",
-        }
-        run_display = run_display.rename(columns=run_rename)
-        if "Timestamp" in run_display.columns:
-            # Trim to readable format
-            run_display["Timestamp"] = run_display["Timestamp"].str[:19].str.replace("T", " ")
-        if "Duration (s)" in run_display.columns:
-            run_display["Duration (s)"] = run_display["Duration (s)"].round(1)
-
-        st.dataframe(run_display, use_container_width=True, hide_index=True)
-
-        # ── New threats per run bar chart ──────────────────────────────────
-        if len(runs_df) >= 2 and "new_threats" in runs_df.columns:
-            st.markdown("#### New Threats per Run")
-            plot_runs = runs_df.sort_values("run_id").tail(20)
-            x_labels  = [f"Run {int(r)}" for r in plot_runs["run_id"]]
-            new_vals  = plot_runs["new_threats"].fillna(0).astype(int).tolist()
-            chg_vals  = plot_runs["updated_threats"].fillna(0).astype(int).tolist()
-
-            fig_r, ax_r = plt.subplots(figsize=(min(10, len(x_labels) + 2), 3.5))
-            fig_r.patch.set_facecolor("#0d0d1a")
-            ax_r.set_facecolor("#130d2e")
-            x_pos = range(len(x_labels))
-            w = 0.38
-            ax_r.bar([x - w/2 for x in x_pos], new_vals,
-                     width=w, color="#7c3aed", label="New", edgecolor="#4a1d96", linewidth=0.6)
-            ax_r.bar([x + w/2 for x in x_pos], chg_vals,
-                     width=w, color="#f97316", label="Priority changed", edgecolor="#4a1d96", linewidth=0.6)
-            ax_r.set_xticks(list(x_pos))
-            ax_r.set_xticklabels(x_labels, rotation=30, ha="right", fontsize=8, color="#c4b5fd")
-            ax_r.set_ylabel("Threats", color="#a78bfa", fontsize=9)
-            ax_r.set_title("New & Changed Threats per Run", color="#c084fc",
-                           fontsize=10, fontweight="bold")
-            ax_r.tick_params(colors="#c4b5fd", labelsize=8)
-            ax_r.spines[:].set_color("#4a1d96")
-            ax_r.legend(facecolor="#1a0a3d", edgecolor="#4a1d96",
-                        labelcolor="#c4b5fd", fontsize=8)
-            plt.tight_layout()
-            st.pyplot(fig_r, use_container_width=True)
-            plt.close(fig_r)
-
-    if has_history:
-        st.divider()
-
-        # ── Threat activity feed ───────────────────────────────────────────
-        st.markdown("#### Threat Activity Feed")
-        st.caption("Most recent priority changes and new threats, across all runs.")
-
-        CHANGE_COLORS = {
-            "new":       ("#052e16", "#86efac", "#166534", "🆕 NEW"),
-            "escalated": ("#4c0519", "#fda4af", "#9f1239", "⬆ ESCALATED"),
-            "reduced":   ("#0c1a4a", "#93c5fd", "#1d4ed8", "⬇ REDUCED"),
-        }
-
-        # Filter controls
-        fc1, fc2 = st.columns([2, 2])
-        change_filter = fc1.multiselect(
-            "Change type",
-            options=["new", "escalated", "reduced"],
-            default=["new", "escalated", "reduced"],
-            key="monitor_change_filter",
-        )
-        feed_limit = fc2.select_slider(
-            "Show last N events", options=[25, 50, 100, 250], value=50,
-            key="monitor_feed_limit",
-        )
-
-        filtered_hist = hist_df[hist_df["change_type"].isin(change_filter)].head(feed_limit)
-
-        if filtered_hist.empty:
-            st.info("No events matching the current filter.")
-        else:
-            for _, ev in filtered_hist.iterrows():
-                ct = ev.get("change_type", "")
-                bg, fg, border, badge = CHANGE_COLORS.get(
-                    ct, ("#1a0a3d", "#c4b5fd", "#4a1d96", ct.upper())
-                )
-                tid       = ev.get("threat_id", "")
-                title     = ev.get("title") or tid
-                src       = ev.get("source", "")
-                sev       = ev.get("severity_raw", "")
-                prev_p    = ev.get("previous_priority") or "—"
-                new_p     = ev.get("new_priority") or "—"
-                run_at    = str(ev.get("run_at", ""))[:19].replace("T", " ")
-                run_id    = ev.get("run_id", "")
-
-                p_arrow = ""
-                if ct == "escalated":
-                    p_arrow = f"<span style='color:#fda4af;'>{prev_p} → <b>{new_p}</b></span>"
-                elif ct == "reduced":
-                    p_arrow = f"<span style='color:#93c5fd;'>{prev_p} → <b>{new_p}</b></span>"
-                else:
-                    p_arrow = f"<span style='color:#86efac;'>Priority: <b>{new_p}</b></span>"
-
-                sev_str = f" · Sev {float(sev):.1f}/10" if sev != "" else ""
-
-                st.markdown(
-                    f"""
-<div style='background:{bg};border:1px solid {border};border-left:4px solid {border};
-            border-radius:8px;padding:10px 16px;margin-bottom:6px;
-            display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;'>
-  <span style='background:{border};color:{fg};border-radius:10px;
-               padding:2px 8px;font-size:0.7rem;font-weight:700;
-               letter-spacing:0.5px;white-space:nowrap;'>{badge}</span>
-  <div style='flex:1;min-width:200px;'>
-    <span style='color:#e9d5ff;font-weight:600;font-size:0.9rem;'>{title[:70]}</span>
-    <div style='color:#9f7aea;font-size:0.8rem;margin-top:2px;'>
-      {p_arrow}
-      <span style='color:#7c5cbf;margin-left:8px;'>
-        {src}{sev_str} · Run #{run_id} · {run_at}
-      </span>
-    </div>
-  </div>
-</div>""",
-                    unsafe_allow_html=True,
-                )
-
-        st.divider()
-
-        # ── Per-threat history lookup ──────────────────────────────────────
-        st.markdown("#### Threat History Lookup")
-        st.caption("Track how a specific threat's priority has changed over time.")
-
-        threat_ids_with_history = sorted(hist_df["threat_id"].unique().tolist())
-        if threat_ids_with_history:
-            sel_hist_id = st.selectbox(
-                "Select a threat",
-                options=threat_ids_with_history,
-                format_func=lambda x: f"{x[:70]}..." if len(str(x)) > 70 else x,
-                key="monitor_threat_select",
-            )
-            threat_hist = fetch_threat_history_for_id(sel_hist_id)
-            if threat_hist:
-                th_df = pd.DataFrame(threat_hist)[[
-                    "run_id", "run_at", "change_type",
-                    "previous_priority", "new_priority",
-                    "previous_score",   "new_score",
-                ]]
-                th_df = th_df.rename(columns={
-                    "run_id": "Run #", "run_at": "Timestamp",
-                    "change_type": "Change", "previous_priority": "Previous Priority",
-                    "new_priority": "New Priority", "previous_score": "Prev Score",
-                    "new_score": "New Score",
-                })
-                if "Timestamp" in th_df.columns:
-                    th_df["Timestamp"] = th_df["Timestamp"].str[:19].str.replace("T", " ")
-                for sc in ("Prev Score", "New Score"):
-                    if sc in th_df.columns:
-                        th_df[sc] = th_df[sc].apply(
-                            lambda v: round(float(v), 4) if v is not None else "—"
-                        )
-                st.dataframe(th_df, use_container_width=True, hide_index=True)
-
-                # Mini timeline chart if multiple history entries
-                if len(threat_hist) >= 2:
-                    scores = [
-                        float(r["new_score"]) if r.get("new_score") is not None else None
-                        for r in threat_hist
-                    ]
-                    run_labels = [f"Run {r['run_id']}" for r in threat_hist]
-                    valid = [(lbl, s) for lbl, s in zip(run_labels, scores) if s is not None]
-                    if len(valid) >= 2:
-                        lbl_v, sc_v = zip(*valid)
-                        fig_h, ax_h = plt.subplots(figsize=(min(8, len(valid) + 1), 2.8))
-                        fig_h.patch.set_facecolor("#0d0d1a")
-                        ax_h.set_facecolor("#130d2e")
-                        ax_h.plot(lbl_v, sc_v, color="#a855f7", linewidth=2,
-                                  marker="o", markersize=6, markerfacecolor="#c084fc")
+            st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+            st.markdown("<span class='eyebrow'>Per-Threat Timeline</span>", unsafe_allow_html=True)
+            if not hist_df2.empty:
+                th_ids = sorted(hist_df2["threat_id"].dropna().unique().tolist())
+                sel_th = st.selectbox("Select threat", options=th_ids,
+                                       format_func=lambda x: f"{x[:55]}..." if len(str(x))>55 else x,
+                                       key="mon_th_sel")
+                from src.pipeline.db import fetch_threat_history_for_id
+                th_hist = fetch_threat_history_for_id(sel_th)
+                if th_hist and len(th_hist) >= 2:
+                    scores  = [float(h["new_score"]) for h in th_hist if h.get("new_score") is not None]
+                    run_lbs = [f"R{h['run_id']}" for h in th_hist if h.get("new_score") is not None]
+                    if len(scores) >= 2:
+                        fig_h, ax_h = plt.subplots(figsize=(5, 2.5))
+                        fig_h.patch.set_facecolor("#eef2e3")
+                        ax_h.set_facecolor("#fcfcfc")
+                        ax_h.plot(run_lbs, scores, color="#043f2e", linewidth=2,
+                                   marker="o", markersize=5, markerfacecolor="#c8f169",
+                                   markeredgecolor="#043f2e", markeredgewidth=1.2)
                         ax_h.set_ylim(0, 1.05)
-                        ax_h.set_ylabel("Priority Score", color="#a78bfa", fontsize=9)
-                        ax_h.set_title(
-                            f"Priority Score History — {sel_hist_id[:40]}",
-                            color="#c084fc", fontsize=9, fontweight="bold",
-                        )
-                        ax_h.tick_params(colors="#c4b5fd", labelsize=8)
-                        ax_h.spines[:].set_color("#4a1d96")
-                        plt.xticks(rotation=20, ha="right")
+                        ax_h.tick_params(colors="#6b7c6a", labelsize=8)
+                        ax_h.spines[:].set_color("#e8edd9")
+                        ax_h.set_ylabel("Score", color="#6b7c6a", fontsize=8)
+                        plt.xticks(rotation=15, ha="right")
                         plt.tight_layout()
                         st.pyplot(fig_h, use_container_width=True)
                         plt.close(fig_h)
-
-
-    # ── Phase 6: Reports ──────────────────────────────────────────────────────
-    st.divider()
-    st.markdown("### 📄 Generate Intelligence Report")
-    st.markdown("""
-<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:10px;
-            padding:14px 18px;margin-bottom:16px;font-size:0.88rem;color:#c4b5fd;'>
-<b style='color:#a855f7'>About reports</b><br>
-Generates a self-contained HTML file with embedded charts covering the full threat
-landscape — executive summary, priority breakdown, top threats, priority changes,
-cluster summary, MITRE ATT&CK coverage, alerts, and a full threat appendix.<br><br>
-Reports are reproducible from the DB alone (no external API calls).
-Each report is saved to <code>reports/</code> with a timestamp filename.
-</div>
-""", unsafe_allow_html=True)
-
-    from src.pipeline.reporter import generate_html_report as _gen_report
-    from src.pipeline.db import fetch_all_mitre_mappings as _fetch_all_mitre
-    from src.pipeline.db import fetch_alerts as _fetch_alerts_report
-    import datetime as _dt
-
-    # ── Date-range / run scope selector ───────────────────────────────────
-    report_run_filter = None
-    if has_runs and len(runs_df) > 1:
-        run_ids_available = sorted(runs_df["run_id"].tolist())
-        rr1, rr2 = st.columns(2)
-        scope_mode = rr1.radio(
-            "Report scope",
-            options=["All runs", "Select specific runs"],
-            horizontal=True,
-            key="report_scope_mode",
-        )
-        if scope_mode == "Select specific runs":
-            selected_run_ids = rr2.multiselect(
-                "Include runs",
-                options=run_ids_available,
-                default=run_ids_available[-3:] if len(run_ids_available) >= 3
-                        else run_ids_available,
-                key="report_run_select",
-            )
-            if selected_run_ids:
-                report_run_filter = set(selected_run_ids)
-
-    # ── Generate button ────────────────────────────────────────────────────
-    gen_col, _ = st.columns([2, 6])
-    if gen_col.button("📄 Generate Report", key="gen_report_btn", type="primary"):
-        with st.spinner("Building report — this may take a few seconds..."):
-            _r_rows    = db.fetch_all_as_dicts()
-            _r_runs    = db.fetch_pipeline_runs(limit=50)
-            _r_history = db.fetch_threat_history(limit=2000)
-            _r_mitre   = _fetch_all_mitre()
-            _r_alerts  = _fetch_alerts_report(limit=500)
-
-            _html = _gen_report(
-                rows=_r_rows,
-                runs=_r_runs,
-                history=_r_history,
-                mitre=_r_mitre,
-                alerts=_r_alerts,
-                run_filter_ids=report_run_filter,
-            )
-
-            # Save to reports/ directory
-            _ts        = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            _out_path  = REPORTS_DIR / f"threat_report_{_ts}.html"
-            _out_path.write_text(_html, encoding="utf-8")
-
-            # Store in session state for download button
-            st.session_state["last_report_html"]     = _html
-            st.session_state["last_report_filename"]  = f"threat_report_{_ts}.html"
-            st.session_state["last_report_timestamp"] = _ts
-            st.session_state["last_report_path"]      = str(_out_path)
-
-        st.success(f"Report generated and saved to `{_out_path.name}`")
-
-    # ── Download button (shown after generation) ───────────────────────────
-    if "last_report_html" in st.session_state:
-        dl_col1, dl_col2, _ = st.columns([2.5, 2.5, 3])
-        dl_col1.download_button(
-            label="⬇ Download HTML Report",
-            data=st.session_state["last_report_html"].encode("utf-8"),
-            file_name=st.session_state["last_report_filename"],
-            mime="text/html",
-            key="download_report_btn",
-        )
-        dl_col2.markdown(
-            f"<div style='color:#9f7aea;font-size:0.82rem;padding-top:8px;'>"
-            f"Generated: {st.session_state['last_report_timestamp']}</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"<div style='color:#5b21b6;font-size:0.78rem;margin-top:4px;'>"
-            f"Saved to: <code>{st.session_state['last_report_path']}</code></div>",
-            unsafe_allow_html=True,
-        )
-
-    # ── Saved reports list ─────────────────────────────────────────────────
-    st.markdown("#### Saved Reports")
-    saved_reports = sorted(REPORTS_DIR.glob("threat_report_*.html"), reverse=True)
-    if not saved_reports:
-        st.caption("No saved reports yet — click 'Generate Report' above.")
     else:
-        st.caption(f"{len(saved_reports)} report(s) saved in `reports/`")
-        for rpt in saved_reports[:10]:
-            size_kb = rpt.stat().st_size / 1024
-            # Parse timestamp from filename for display
-            stem_parts = rpt.stem.replace("threat_report_", "")
-            try:
-                rpt_dt = _dt.datetime.strptime(stem_parts, "%Y%m%d_%H%M%S")
-                rpt_label = rpt_dt.strftime("%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                rpt_label = stem_parts
+        st.info("No pipeline runs recorded yet. Run the pipeline to start monitoring.")
 
-            rc1, rc2, rc3 = st.columns([3, 1.5, 2])
-            rc1.markdown(
-                f"<span style='color:#c4b5fd;font-size:0.88rem;'>{rpt.name}</span>",
-                unsafe_allow_html=True,
-            )
-            rc2.markdown(
-                f"<span style='color:#7c5cbf;font-size:0.82rem;'>{size_kb:.0f} KB</span>",
-                unsafe_allow_html=True,
-            )
-            # Offer re-download of saved file
-            rc3.download_button(
-                label="⬇ Download",
-                data=rpt.read_bytes(),
-                file_name=rpt.name,
-                mime="text/html",
-                key=f"dl_saved_{rpt.name}",
-            )
-
-
-# ══════════════════════════════════════════════
-#  TAB 5 — ALERTS  (Phase 5)
-# ══════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAB 6 — ALERTS (capped 20 visible, fast acknowledge)
+# ═════════════════════════════════════════════════════════════════════════════
 with tab_alerts:
+    st.markdown("<span class='eyebrow'>Alerts</span>", unsafe_allow_html=True)
 
-    # Reload alert counts live (session_state changes on button clicks)
-    all_alerts = _fetch_alerts(limit=500)
-    alerts_df  = pd.DataFrame(all_alerts) if all_alerts else pd.DataFrame()
+    al_c1, al_c2, al_c3 = st.columns([2, 2, 1])
+    with al_c1:
+        sev_filter_al = st.multiselect(
+            "Severity", options=["critical","high","warning","info"],
+            default=["critical","high","warning","info"], key="al_sev",
+        )
+    with al_c2:
+        stat_filter_al = st.multiselect(
+            "Status", options=["new","acknowledged","dismissed"],
+            default=["new"], key="al_stat",
+        )
+    with al_c3:
+        al_limit = st.selectbox("Show", options=[10, 20, 50], index=1, key="al_limit")
 
-    st.markdown("### 🚨 Analyst Alerts")
-    st.markdown("""
-<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:10px;
-            padding:14px 18px;margin-bottom:16px;font-size:0.88rem;color:#c4b5fd;'>
-<b style='color:#a855f7'>How alerts work</b><br>
-Alerts are generated automatically after each pipeline run. They surface events
-that warrant analyst attention without requiring manual review of every threat.
-<ul style='margin:6px 0 0 0;padding-left:18px;'>
-  <li><b style='color:#fda4af'>new_critical</b> — a brand-new Critical threat appeared</li>
-  <li><b style='color:#fdba74'>new_high</b> — a brand-new High threat appeared</li>
-  <li><b style='color:#fda4af'>priority_escalated</b> — an existing threat escalated to Critical or High</li>
-  <li><b style='color:#fdba74'>exploit_appeared</b> — exploitation evidence newly flagged on a known threat</li>
-  <li><b style='color:#fde68a'>notable_cluster</b> — a cluster crossed a notable severity/exploitation threshold</li>
-  <li><b style='color:#fde68a'>spike</b> — new threat count exceeded 2× the rolling run average</li>
-</ul>
-<br>
-Alerts are <b>dashboard-only</b> — no external emails or webhooks are sent.
-</div>
-""", unsafe_allow_html=True)
-
-    if alerts_df.empty:
-        st.info(
-            "No alerts yet. Run the pipeline to generate alerts:\n\n"
-            "```\npython scripts/run_pipeline.py --retrain\n```"
+    all_alerts_raw = _fetch_alerts(limit=500)
+    if not all_alerts_raw:
+        st.markdown(
+            "<div style='background:#fcfcfc;border-radius:12px;padding:40px;"
+            "text-align:center;border:1px solid #e8edd9;color:#6b7c6a;'>"
+            "✅ No alerts generated yet. Run the pipeline to trigger alerting.</div>",
+            unsafe_allow_html=True,
         )
     else:
-        # ── Summary metrics ────────────────────────────────────────────────
-        n_new   = int((alerts_df["status"] == "new").sum())
-        n_ack   = int((alerts_df["status"] == "acknowledged").sum())
-        n_dis   = int((alerts_df["status"] == "dismissed").sum())
-        n_crit_al = int((alerts_df["severity"] == "critical").sum())
-        n_high_al = int((alerts_df["severity"] == "high").sum())
-        n_warn_al = int((alerts_df["severity"] == "warning").sum())
+        al_df = pd.DataFrame(all_alerts_raw)
+        filtered_al = al_df[
+            al_df["severity"].isin(sev_filter_al) &
+            al_df["status"].isin(stat_filter_al)
+        ].head(al_limit)
 
-        am1, am2, am3, am4, am5, am6 = st.columns(6)
-        am1.metric("🔴 Unacknowledged", n_new)
-        am2.metric("✅ Acknowledged",   n_ack)
-        am3.metric("🚫 Dismissed",      n_dis)
-        am4.metric("Critical",          n_crit_al)
-        am5.metric("High",              n_high_al)
-        am6.metric("Warning",           n_warn_al)
+        unread_count = int((al_df["status"] == "new").sum())
+        total_count  = len(al_df)
 
-        st.divider()
-
-        # ── Filter controls ────────────────────────────────────────────────
-        af1, af2, af3 = st.columns([2, 2, 2])
-        sev_filter = af1.multiselect(
-            "Severity",
-            options=["critical", "high", "warning", "info"],
-            default=["critical", "high", "warning", "info"],
-            key="alert_sev_filter",
-        )
-        status_filter = af2.multiselect(
-            "Status",
-            options=["new", "acknowledged", "dismissed"],
-            default=["new", "acknowledged"],
-            key="alert_status_filter",
-        )
-        type_opts = sorted(alerts_df["alert_type"].unique().tolist())
-        type_filter_al = af3.multiselect(
-            "Alert type",
-            options=type_opts,
-            default=type_opts,
-            key="alert_type_filter",
+        st.markdown(
+            f"<div style='font-size:0.85rem;color:#6b7c6a;margin-bottom:14px;'>"
+            f"<strong style='color:#043f2e;'>{unread_count}</strong> unread · "
+            f"<strong style='color:#043f2e;'>{total_count}</strong> total · "
+            f"showing <strong style='color:#043f2e;'>{len(filtered_al)}</strong></div>",
+            unsafe_allow_html=True,
         )
 
-        # ── Bulk actions ───────────────────────────────────────────────────
-        ba1, ba2, _ = st.columns([2, 2, 4])
-        if ba1.button("✅ Acknowledge all new", key="ack_all_btn"):
-            new_ids = alerts_df[alerts_df["status"] == "new"]["alert_id"].tolist()
-            for aid in new_ids:
-                _update_alert_status(int(aid), "acknowledged")
-            st.rerun()
-        if ba2.button("🚫 Dismiss all acknowledged", key="dis_all_btn"):
-            ack_ids = alerts_df[alerts_df["status"] == "acknowledged"]["alert_id"].tolist()
-            for aid in ack_ids:
-                _update_alert_status(int(aid), "dismissed")
-            st.rerun()
+        if not filtered_al.empty:
+            # Bulk acknowledge button
+            if unread_count > 0:
+                bc1, bc2 = st.columns([1, 5])
+                if bc1.button("✓ Acknowledge all new", key="ack_all"):
+                    new_ids = al_df[al_df["status"] == "new"]["alert_id"].tolist()
+                    for aid in new_ids:
+                        _update_alert_status(int(aid), "acknowledged")
+                    st.success(f"Acknowledged {len(new_ids)} alerts.")
+                    st.rerun()
 
-        st.divider()
-
-        # ── Apply filters ──────────────────────────────────────────────────
-        vis = alerts_df[
-            alerts_df["severity"].isin(sev_filter) &
-            alerts_df["status"].isin(status_filter) &
-            alerts_df["alert_type"].isin(type_filter_al)
-        ].copy()
-
-        if vis.empty:
-            st.info("No alerts match the current filters.")
-        else:
-            st.markdown(
-                f"<div style='color:#9f7aea;font-size:0.85rem;margin-bottom:10px;'>"
-                f"Showing {len(vis)} alert(s)</div>",
-                unsafe_allow_html=True,
-            )
-
-            # Colour palettes per severity
-            SEV_STYLE = {
-                "critical": {
-                    "bg":     "#2d0a0a",
-                    "border": "#9f1239",
-                    "text":   "#fda4af",
-                    "badge_bg": "#4c0519",
-                    "icon":   "🔴",
-                },
-                "high": {
-                    "bg":     "#2d1407",
-                    "border": "#9a3412",
-                    "text":   "#fdba74",
-                    "badge_bg": "#431407",
-                    "icon":   "🟠",
-                },
-                "warning": {
-                    "bg":     "#2d2509",
-                    "border": "#92400e",
-                    "text":   "#fde68a",
-                    "badge_bg": "#3b2509",
-                    "icon":   "🟡",
-                },
-                "info": {
-                    "bg":     "#0d1a2d",
-                    "border": "#1d4ed8",
-                    "text":   "#93c5fd",
-                    "badge_bg": "#0c1a4a",
-                    "icon":   "🔵",
-                },
+            AL_STYLE_M = {
+                "critical": ("#dc2626", "#fff5f5", "🔴"),
+                "high":     ("#ea580c", "#fff8f0", "🟠"),
+                "warning":  ("#ca8a04", "#fffdf0", "🟡"),
+                "info":     ("#043f2e", "#f0f7f0", "🟢"),
             }
+            for _, al in filtered_al.iterrows():
+                sev2   = str(al.get("severity","info")).lower()
+                status2= al.get("status","new")
+                atype2 = al.get("alert_type","").replace("_"," ").title()
+                msg2   = al.get("message","")
+                aid2   = int(al.get("alert_id", 0))
+                tid3   = str(al.get("threat_id") or "")
+                tid3   = "" if tid3 in ("nan","None","") else tid3
+                run_id3= al.get("run_id","")
+                created= str(al.get("created_at",""))[:16].replace("T"," ")
 
-            STATUS_LABEL = {
-                "new":          ("🔔 NEW",          "#9f1239", "#fda4af"),
-                "acknowledged": ("✅ ACKNOWLEDGED", "#166534", "#86efac"),
-                "dismissed":    ("🚫 DISMISSED",    "#374151", "#9ca3af"),
-            }
-
-            TYPE_LABEL = {
-                "new_critical":       "New Critical",
-                "new_high":           "New High",
-                "priority_escalated": "Escalated",
-                "exploit_appeared":   "Exploit Appeared",
-                "notable_cluster":    "Notable Cluster",
-                "spike":              "Spike",
-            }
-
-            for _, alert in vis.iterrows():
-                sev      = alert.get("severity", "info")
-                status   = alert.get("status",   "new")
-                atype    = alert.get("alert_type", "")
-                msg      = alert.get("message",    "")
-                alert_id = int(alert.get("alert_id", 0))
-                tid      = str(alert.get("threat_id") or "") if alert.get("threat_id") and str(alert.get("threat_id")) not in ("nan", "None", "") else ""
-                run_id_a = alert.get("run_id", "")
-                created  = str(alert.get("created_at", ""))[:19].replace("T", " ")
-
-                sty = SEV_STYLE.get(sev, SEV_STYLE["info"])
-                slabel, sbg, sfg = STATUS_LABEL.get(
-                    status, ("UNKNOWN", "#374151", "#9ca3af")
-                )
-                type_display = TYPE_LABEL.get(atype, atype.replace("_", " ").title())
-
-                # Dimmed styling for dismissed alerts
-                opacity = "0.45" if status == "dismissed" else "1"
-                new_border_extra = (
-                    f"box-shadow:0 0 0 2px {sty['border']}55;" if status == "new" else ""
-                )
+                brd_col, bg_col, dot3 = AL_STYLE_M.get(sev2, ("#043f2e","#f0f7f0","•"))
+                opacity = "0.5" if status2 == "dismissed" else "1"
 
                 st.markdown(
-                    f"""
-<div style='background:{sty["bg"]};border:1px solid {sty["border"]};
-            border-left:4px solid {sty["border"]};border-radius:10px;
-            padding:14px 18px;margin-bottom:8px;opacity:{opacity};
-            {new_border_extra}'>
-  <div style='display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;'>
-    <span style='font-size:1.3rem;'>{sty["icon"]}</span>
-    <div style='flex:1;min-width:250px;'>
-      <div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;'>
-        <span style='background:{sty["badge_bg"]};color:{sty["text"]};
-                     border:1px solid {sty["border"]};border-radius:12px;
-                     padding:2px 10px;font-size:0.72rem;font-weight:700;
-                     letter-spacing:0.5px;'>{sev.upper()}</span>
-        <span style='background:#1a0a3d;color:#a78bfa;border:1px solid #4a1d96;
-                     border-radius:12px;padding:2px 10px;font-size:0.72rem;
-                     font-weight:600;'>{type_display}</span>
-        <span style='background:{sbg};color:{sfg};border-radius:10px;
-                     padding:2px 8px;font-size:0.7rem;font-weight:700;'>{slabel}</span>
-      </div>
-      <div style='color:#e9d5ff;font-size:0.9rem;line-height:1.5;'>{msg}</div>
-      <div style='color:#7c5cbf;font-size:0.78rem;margin-top:6px;'>
-        {"Threat: <code style='color:#a78bfa;'>" + tid[:60] + "</code> &nbsp;·&nbsp; " if tid else ""}
-        Run #{run_id_a} &nbsp;·&nbsp; {created}
-      </div>
-    </div>
-  </div>
-</div>""",
+                    f"<div style='border-left:4px solid {brd_col};background:{bg_col};"
+                    f"border-radius:8px;padding:12px 16px;margin-bottom:8px;opacity:{opacity};'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;'>"
+                    f"<div>"
+                    f"<span style='font-size:10px;font-weight:700;text-transform:uppercase;"
+                    f"letter-spacing:0.06em;color:{brd_col};'>{dot3} {atype2}</span>"
+                    f"<div style='font-size:0.88rem;color:#043f2e;margin-top:4px;"
+                    f"font-weight:500;'>{msg2[:130]}</div>"
+                    f"<div style='font-size:0.75rem;color:#6b7c6a;margin-top:4px;'>"
+                    f"{'ID: ' + tid3[:45] + ' · ' if tid3 else ''}Run #{run_id3} · {created}"
+                    f"&nbsp;·&nbsp;<span style='font-weight:600;'>{status2.upper()}</span></div>"
+                    f"</div>"
+                    f"</div>"
+                    f"</div>",
                     unsafe_allow_html=True,
                 )
 
-                # Action buttons — only show for non-dismissed
-                if status != "dismissed":
-                    btn_col1, btn_col2, _ = st.columns([1.4, 1.4, 7])
-                    if status == "new":
-                        if btn_col1.button(
-                            "✅ Acknowledge", key=f"ack_{alert_id}",
-                        ):
-                            _update_alert_status(alert_id, "acknowledged")
+                # Action buttons — only for non-dismissed
+                if status2 != "dismissed":
+                    btn_c1, btn_c2, btn_c3 = st.columns([1, 1, 8])
+                    if status2 == "new":
+                        if btn_c1.button("✓ Ack", key=f"ack_{aid2}"):
+                            _update_alert_status(aid2, "acknowledged")
                             st.rerun()
-                    if btn_col2.button(
-                        "🚫 Dismiss", key=f"dis_{alert_id}",
-                    ):
-                        _update_alert_status(alert_id, "dismissed")
+                    if btn_c2.button("✕ Dismiss", key=f"dis_{aid2}"):
+                        _update_alert_status(aid2, "dismissed")
                         st.rerun()
 
-        st.divider()
-        st.caption(
-            "Alerts are generated automatically by the pipeline and stored in the local SQLite database. "
-            "No external notifications are sent. Re-run the pipeline to refresh alert data."
-        )
-
-
-# ══════════════════════════════════════════════
-#  TAB 6 — SETTINGS / ORG CONTEXT  (Phase 10)
-# ══════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAB 7 — SETTINGS
+# ═════════════════════════════════════════════════════════════════════════════
 with tab_settings:
     from src.config_org import load_org_context, save_org_context, org_context_configured
     from src.pipeline.context_scorer import apply_context_score
 
-    st.markdown("### ⚙️ Settings — Organisational Context")
+    st.markdown("<span class='eyebrow'>Organisational Context</span>", unsafe_allow_html=True)
     st.markdown("""
-<div style='background:#1a0a3d;border:1px solid #4a1d96;border-radius:10px;
-            padding:14px 18px;margin-bottom:16px;font-size:0.88rem;color:#c4b5fd;'>
-<b style='color:#a855f7'>What is Organisational Context?</b><br>
-Configure your organisation's asset environment so threat priority can be
-contextualised against what actually matters to you. The platform will apply
-small score boosts to threats that match your high-value assets or exposure profile.
-<br><br>
-<b>Important:</b> This produces a <em>context-adjusted score</em> for display only.
-It never overwrites the ML prediction or retrains the model.
-The org context is stored in <code>org_context.json</code> (not committed to git).
-After saving, re-run the pipeline to apply context scores:
-<code>python scripts/run_pipeline.py --retrain</code>
+<div style='background:#fcfcfc;border-radius:12px;padding:14px 18px;border:1px solid #e8edd9;
+            margin-bottom:20px;font-size:0.85rem;color:#6b7c6a;'>
+Configure your asset profile to receive a <em>context-adjusted score</em> alongside the ML prediction.
+This score is for display guidance only — it never retrains the model.
+Saved to <code>org_context.json</code> (not committed to git).
+After saving, re-run: <code>python scripts/run_pipeline.py --retrain</code>
 </div>
 """, unsafe_allow_html=True)
 
     current_ctx = load_org_context()
     configured  = org_context_configured()
-
     if configured:
-        st.success(f"Org context configured for: **{current_ctx.get('org_name', 'unnamed')}**")
-    else:
-        st.info("No org context configured yet. Fill in the form below and click Save.")
+        st.success(f"Context configured: **{current_ctx.get('org_name','unnamed')}**")
 
-    st.markdown("#### Organisation Profile")
-
-    with st.form("org_context_form"):
-        org_name = st.text_input(
-            "Organisation name",
-            value=current_ctx.get("org_name", ""),
-            placeholder="e.g. Acme Corp",
-        )
-        high_value_raw = st.text_input(
-            "High-value asset keywords (comma-separated)",
-            value=", ".join(current_ctx.get("high_value_assets", [])),
-            placeholder="e.g. Apache, Microsoft, OpenSSL, Cisco",
-            help="CVEs mentioning these vendors/products will receive a score boost.",
-        )
-        internet_exposed = st.checkbox(
-            "Internet-exposed environment",
-            value=bool(current_ctx.get("internet_exposed", False)),
-            help="Tick if your systems are directly reachable from the internet. "
-                 "High/Critical threats receive an additional boost.",
-        )
-        criticality_options = ["low", "medium", "high", "critical"]
-        criticality = st.selectbox(
-            "Organisation criticality",
-            options=criticality_options,
-            index=criticality_options.index(
-                current_ctx.get("criticality", "medium")
-            ),
-            help="How critical is your organisation? Higher criticality applies a "
-                 "global score boost to all threats.",
-        )
-        ignored_sources_raw = st.text_input(
-            "Ignored sources (comma-separated, leave blank for none)",
-            value=", ".join(current_ctx.get("ignored_sources", [])),
-            placeholder="e.g. greynoise",
-            help="Threats from these sources will be suppressed (context score = 0).",
-        )
-
-        saved = st.form_submit_button("💾 Save Configuration")
+    with st.form("org_form"):
+        org_name = st.text_input("Organisation name", value=current_ctx.get("org_name",""), placeholder="e.g. Acme Corp")
+        hv_raw   = st.text_input("High-value asset keywords (comma-separated)",
+                                   value=", ".join(current_ctx.get("high_value_assets",[])),
+                                   placeholder="e.g. Apache, OpenSSL, Cisco, Microsoft")
+        inet_exp = st.checkbox("Internet-exposed environment", value=bool(current_ctx.get("internet_exposed", False)))
+        crit_opt = ["low","medium","high","critical"]
+        criticality = st.selectbox("Organisation criticality", options=crit_opt,
+                                    index=crit_opt.index(current_ctx.get("criticality","medium")))
+        ign_raw  = st.text_input("Ignored sources (comma-separated, leave blank for none)",
+                                  value=", ".join(current_ctx.get("ignored_sources",[])))
+        saved = st.form_submit_button("💾  Save Configuration")
 
     if saved:
-        new_ctx = {
+        save_org_context({
             "org_name":          org_name.strip(),
-            "high_value_assets": [a.strip() for a in high_value_raw.split(",") if a.strip()],
-            "internet_exposed":  internet_exposed,
+            "high_value_assets": [a.strip() for a in hv_raw.split(",") if a.strip()],
+            "internet_exposed":  inet_exp,
             "criticality":       criticality,
-            "ignored_sources":   [s.strip() for s in ignored_sources_raw.split(",") if s.strip()],
-        }
-        save_org_context(new_ctx)
-        st.success(
-            "Configuration saved to `org_context.json`. "
-            "Re-run the pipeline (`--retrain`) to apply context scores to all threats."
-        )
+            "ignored_sources":   [s.strip() for s in ign_raw.split(",") if s.strip()],
+        })
+        st.success("Saved. Re-run the pipeline to apply context scores to all threats.")
         st.rerun()
 
-    # ── Context score preview ──────────────────────────────────────────────
     if configured and not saved:
         st.divider()
-        st.markdown("#### Live Context Score Preview")
-        st.caption(
-            "Shows how the current configuration adjusts scores for a sample of threats. "
-            "Context-adjusted scores are for analyst guidance only — they do not change "
-            "ML predictions or retraining labels."
-        )
-
-        preview_rows = df.head(20).to_dict(orient="records")
+        st.markdown("<span class='eyebrow'>Live Preview (first 15 threats)</span>", unsafe_allow_html=True)
+        preview_rows = df.head(15).to_dict(orient="records")
         ctx = load_org_context()
-        preview_data = []
+        prev_data = []
         for row in preview_rows:
-            adj_score, reasons = apply_context_score(row, ctx)
+            adj, reasons = apply_context_score(row, ctx)
             base = round(float(row.get("predicted_priority_score") or 0), 4)
-            adj  = round(adj_score, 4) if adj_score is not None else base
-            diff = round(adj - base, 4) if adj_score is not None else 0
-            preview_data.append({
-                "ID":             str(row.get("id", ""))[:35],
-                "ML Priority":    row.get("predicted_priority", "—"),
-                "Base Score":     base,
-                "Context Score":  adj,
-                "Boost":          f"+{diff:.4f}" if diff > 0 else str(diff),
-                "Reason":         reasons[0] if reasons else "—",
+            adj_v = round(adj, 4) if adj is not None else base
+            diff  = round(adj_v - base, 4) if adj is not None else 0
+            prev_data.append({
+                "ID":            str(row.get("id",""))[:35],
+                "ML Priority":   row.get("predicted_priority","—"),
+                "Base Score":    base,
+                "Context Score": adj_v,
+                "Boost":         f"+{diff:.4f}" if diff > 0 else str(diff),
+                "Reason":        reasons[0][:60] if reasons else "—",
             })
-        st.dataframe(pd.DataFrame(preview_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(prev_data), use_container_width=True, hide_index=True)
 
-        # Context score column in the main threats df (if column exists)
-        if "context_adjusted_score" in df.columns and df["context_adjusted_score"].notna().any():
-            st.divider()
-            n_boosted = int((df["context_adjusted_score"].fillna(0) >
-                             df["predicted_priority_score"].fillna(0)).sum())
-            n_suppressed = int((df["context_adjusted_score"] == 0).sum())
-            cb1, cb2, cb3 = st.columns(3)
-            cb1.metric("Threats with context score", int(df["context_adjusted_score"].notna().sum()))
-            cb2.metric("Received boost",             n_boosted)
-            cb3.metric("Suppressed (ignored source)", n_suppressed)
-
-
-# ══════════════════════════════════════════════
-#  TAB 7 — MODEL EVALUATION  (original content)
-# ══════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+#  TAB 8 — MODEL EVALUATION
+# ═════════════════════════════════════════════════════════════════════════════
 with tab_models:
+    st.markdown("<span class='eyebrow'>Model Evaluation</span>", unsafe_allow_html=True)
+    st.markdown("""
+<div style='background:#fcfcfc;border-radius:12px;padding:12px 16px;border:1px solid #e8edd9;
+            margin-bottom:16px;font-size:0.82rem;color:#6b7c6a;'>
+⚠ Labels are heuristic — accuracy reflects how well the model learns the scoring formula,
+not real analyst agreement. F1 &lt; 0.5 on Critical/High is expected with severe class imbalance.
+</div>
+""", unsafe_allow_html=True)
+
     metrics_path = REPORTS_DIR / "metrics.json"
-    if metrics_path.exists():
-        st.markdown("### 🤖 Model Evaluation")
+    if not metrics_path.exists():
+        st.info("No evaluation metrics found. Run the pipeline to generate them.")
+    else:
         with open(metrics_path) as f:
             metrics = json.load(f)
 
-        cols = st.columns(len(metrics))
-        for col, (name, m) in zip(cols, metrics.items()):
+        # Accuracy row
+        acc_cols = st.columns(len(metrics))
+        for col, (name, m) in zip(acc_cols, metrics.items()):
             col.metric(
-                name.replace("_", " ").title(),
-                f"{m['accuracy'] * 100:.1f}%",
-                help="Accuracy on held-out test set",
+                name.replace("_"," ").title(),
+                f"{m['accuracy']*100:.1f}%",
+                help="Accuracy on held-out test set (heuristic labels)",
             )
 
-        # ── Phase 11: Per-class F1 scores ─────────────────────────────────
+        # Per-class F1
         per_class_path = REPORTS_DIR / "per_class_metrics.json"
         f1_chart_path  = REPORTS_DIR / "per_class_f1_comparison.png"
 
         if per_class_path.exists():
             st.divider()
-            st.markdown("#### Per-Class Precision / Recall / F1")
-            st.caption(
-                "F1 scores reflect how well the model learns the heuristic labels — "
-                "not real-world analyst agreement. Low F1 on Critical/High indicates "
-                "class imbalance impact. Values below 0.50 are flagged."
-            )
+            st.markdown("<span class='eyebrow'>Per-Class F1 Scores</span>", unsafe_allow_html=True)
             with open(per_class_path) as f:
                 per_class = json.load(f)
 
             for model_name, class_data in per_class.items():
                 with st.expander(
-                    f"📈 {model_name.replace('_', ' ').title()} — per-class metrics",
+                    f"{model_name.replace('_',' ').title()} — per-class metrics",
                     expanded=(model_name == "random_forest"),
                 ):
                     pc_rows = []
-                    for cls in ["Critical", "High", "Medium", "Low"]:
-                        cd = class_data.get(cls, {})
-                        f1  = cd.get("f1", 0)
-                        flag = "⚠️" if f1 < 0.5 else "✅"
+                    for cls in ["Critical","High","Medium","Low"]:
+                        cd  = class_data.get(cls, {})
+                        f1v = cd.get("f1", 0)
                         pc_rows.append({
                             "Class":     cls,
                             "Precision": cd.get("precision", 0),
                             "Recall":    cd.get("recall",    0),
-                            "F1-Score":  f1,
+                            "F1":        f1v,
                             "Support":   cd.get("support",   0),
-                            "Status":    flag,
+                            "Status":    "⚠️ LOW" if f1v < 0.5 else "✅",
                         })
-                    pc_df = pd.DataFrame(pc_rows)
-                    st.dataframe(pc_df, use_container_width=True, hide_index=True)
-
-                    # Strategy A vs B note for RF SMOTE
+                    st.dataframe(pd.DataFrame(pc_rows), use_container_width=True, hide_index=True)
                     if model_name == "random_forest_smote":
                         st.markdown(
-                            "<div style='background:#052e16;border:1px solid #166534;"
-                            "border-radius:8px;padding:10px 14px;color:#86efac;"
-                            "font-size:0.85rem;'>"
-                            "⚗️ <b>Strategy B (SMOTE)</b> — trained with synthetic minority "
-                            "oversampling. Compare Critical/High F1 with the baseline "
-                            "Random Forest to assess whether SMOTE improves minority-class "
-                            "detection on these heuristic labels."
-                            "</div>",
+                            "<div style='background:#f0fdf4;border-left:3px solid #16a34a;"
+                            "border-radius:6px;padding:8px 12px;font-size:0.82rem;color:#166534;'>"
+                            "⚗️ Strategy B (SMOTE) — compare Critical/High F1 with baseline Random Forest "
+                            "to assess whether oversampling improves minority-class detection.</div>",
                             unsafe_allow_html=True,
                         )
 
         if f1_chart_path.exists():
             st.divider()
-            st.markdown("#### F1 Comparison Chart")
+            st.markdown("<span class='eyebrow'>F1 Comparison Chart</span>", unsafe_allow_html=True)
             st.image(str(f1_chart_path), caption="Per-class F1 across all models (Phase 11)")
 
         st.divider()
-
         for name in metrics:
             cm_path = REPORTS_DIR / f"confusion_matrix_{name}.png"
             fi_path = REPORTS_DIR / f"feature_importance_{name}.png"
             if cm_path.exists() or fi_path.exists():
-                with st.expander(f"📊 {name.replace('_', ' ').title()} — charts"):
+                with st.expander(f"{name.replace('_',' ').title()} — charts", expanded=False):
                     c1, c2 = st.columns(2)
                     if cm_path.exists():
                         c1.image(str(cm_path), caption="Confusion Matrix")
                     if fi_path.exists():
                         c2.image(str(fi_path), caption="Feature Importance")
-    else:
-        st.info("No evaluation metrics found yet — run the training/evaluation step of the pipeline.")
-
-    st.divider()
-    st.caption(
-        "⚠️ Priority labels used for training are derived from a documented heuristic "
-        "(severity · exploitation signal · report volume · recency · source reliability · CWE risk · advisory breadth), "
-        "not analyst-verified ground truth. See README.md for details."
-    )
