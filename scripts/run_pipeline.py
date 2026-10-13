@@ -54,7 +54,11 @@ def collect_live():
     if ip_list:
         key_note = "with API key" if GREYNOISE_API_KEY else "community tier, no key"
         print(f"[collect] querying GreyNoise for {len(ip_list)} IPs ({key_note}, ~1 req/s)...")
-        raw_greynoise = fetch_greynoise_context(ip_list, max_ips=200)
+        # Community tier rate limits kick in quickly at high volumes.
+        # Cap at 50 IPs without a key, 200 with a key.
+        from src.config import GREYNOISE_API_KEY as _gnkey
+        gn_cap = 200 if _gnkey else 50
+        raw_greynoise = fetch_greynoise_context(ip_list, max_ips=gn_cap)
         print(f"[collect] GreyNoise returned {len(raw_greynoise)} classified records")
     else:
         raw_greynoise = []
