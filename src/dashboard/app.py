@@ -1174,6 +1174,71 @@ with tab_monitor:
     else:
         st.info("No pipeline runs recorded yet. Run the pipeline to start monitoring.")
 
+    # ── Download Report ────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("<span class='eyebrow'>Threat Intelligence Report</span>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='background:#fcfcfc;border-radius:12px;padding:14px 18px;"
+        "border:1px solid #e8edd9;margin-bottom:16px;font-size:0.85rem;color:#6b7c6a;'>"
+        "Generates a self-contained HTML report with executive summary, priority distribution, "
+        "top threats, priority changes, cluster summary, MITRE ATT&CK coverage, alerts, "
+        "run history, and the full threat table — all embedded with charts. "
+        "No external dependencies. Opens in any browser."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    rep_c1, rep_c2 = st.columns([2, 3])
+    with rep_c1:
+        scope_opt = st.selectbox(
+            "Report scope",
+            options=["All data", "Latest run only"],
+            key="rep_scope",
+        )
+    with rep_c2:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        if st.button("📥  Generate & Download Report", key="gen_report"):
+            with st.spinner("Generating report…"):
+                try:
+                    from src.pipeline.reporter import generate_html_report
+                    import datetime as _dt
+
+                    _rows    = db.fetch_all_as_dicts()
+                    _runs    = fetch_pipeline_runs(limit=50)
+                    _history = fetch_threat_history(limit=1000)
+                    _mitre   = fetch_all_mitre_mappings()
+                    _alerts  = _fetch_alerts(limit=500)
+
+                    _run_filter = None
+                    if scope_opt == "Latest run only" and _runs:
+                        _run_filter = {_runs[0]["run_id"]}
+
+                    html_report = generate_html_report(
+                        _rows, _runs, _history, _mitre, _alerts,
+                        run_filter_ids=_run_filter,
+                    )
+
+                    _ts       = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    _filename = f"threat_report_{_ts}.html"
+
+                    # Save to reports/ directory
+                    _out = REPORTS_DIR / _filename
+                    _out.write_text(html_report, encoding="utf-8")
+
+                    st.download_button(
+                        label=f"⬇  Download {_filename}",
+                        data=html_report.encode("utf-8"),
+                        file_name=_filename,
+                        mime="text/html",
+                        key=f"dl_{_ts}",
+                    )
+                    st.success(
+                        f"Report generated: **{len(html_report):,}** bytes · "
+                        f"**{len(_rows):,}** threats · also saved to `reports/{_filename}`"
+                    )
+                except Exception as _e:
+                    st.error(f"Report generation failed: {_e}")
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  TAB 6 — ALERTS (capped 20 visible, fast acknowledge)
 # ═════════════════════════════════════════════════════════════════════════════
