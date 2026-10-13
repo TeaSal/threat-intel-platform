@@ -22,6 +22,9 @@ import matplotlib.patches as mpatches
 import streamlit as st
 
 from src.pipeline import db
+from src.pipeline.db import (
+    fetch_analyst_feedback as _fetch_all_feedback,
+)
 from src.config import REPORTS_DIR
 
 # ─────────────────────────────────────────────
