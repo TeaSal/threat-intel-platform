@@ -2156,7 +2156,7 @@ Alerts are <b>dashboard-only</b> — no external emails or webhooks are sent.
                 atype    = alert.get("alert_type", "")
                 msg      = alert.get("message",    "")
                 alert_id = int(alert.get("alert_id", 0))
-                tid      = alert.get("threat_id") or ""
+                tid      = str(alert.get("threat_id") or "") if alert.get("threat_id") and str(alert.get("threat_id")) not in ("nan", "None", "") else ""
                 run_id_a = alert.get("run_id", "")
                 created  = str(alert.get("created_at", ""))[:19].replace("T", " ")
 
