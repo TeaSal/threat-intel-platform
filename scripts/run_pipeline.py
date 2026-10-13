@@ -42,26 +42,24 @@ def collect_live(skip_greynoise: bool = False):
     from src.collectors.nvd_collector import fetch_recent_cves
     from src.collectors.abuseipdb_collector import fetch_malicious_ips
     from src.collectors.greynoise_collector import fetch_greynoise_context
-    from src.config import GREYNOISE_API_KEY
 
     print("[collect] fetching real data from NVD + AbuseIPDB (requires internet + API keys)...")
     raw_nvd       = fetch_recent_cves()
     raw_abuseipdb = fetch_malicious_ips()
 
-    # Phase 7: enrich with GreyNoise — capped at 30 IPs per run (incremental).
-    # Community rate limit is ~1 req/s; 30 IPs ≈ 45 seconds.
-    # Use --no-greynoise to skip entirely for faster runs.
+    # Phase 7: GreyNoise enrichment — OPT-IN only (--greynoise flag).
+    # The community endpoint is always 1 req/s regardless of API key.
+    # 30 IPs × 1.5s = ~45 seconds. Skipped by default for fast runs.
     if not skip_greynoise:
         ip_list = [r["ipAddress"] for r in raw_abuseipdb if r.get("ipAddress")]
         if ip_list:
             existing_ids = db.get_existing_ids()
-            new_ips  = [ip for ip in ip_list if ip not in existing_ids]
+            new_ips   = [ip for ip in ip_list if ip not in existing_ids]
             query_ips = new_ips[:30] if new_ips else ip_list[:30]
-            key_note = "with API key" if GREYNOISE_API_KEY else "community tier, no key"
-            est_secs = len(query_ips) * 1.5
+            est_secs  = len(query_ips) * 1.5
             print(
                 f"[collect] querying GreyNoise for {len(query_ips)} new IPs "
-                f"({key_note}, ~{est_secs:.0f}s)..."
+                f"(community tier, ~{est_secs:.0f}s)..."
             )
             raw_greynoise = fetch_greynoise_context(query_ips, delay_secs=1.5, max_ips=30)
             print(f"[collect] GreyNoise returned {len(raw_greynoise)} classified records")
@@ -70,7 +68,7 @@ def collect_live(skip_greynoise: bool = False):
             print("[collect] no IPs to query GreyNoise for")
     else:
         raw_greynoise = []
-        print("[collect] GreyNoise skipped (--no-greynoise)")
+        print("[collect] GreyNoise skipped (use --greynoise to enable, adds ~45s)")
 
     return raw_nvd, raw_abuseipdb, raw_greynoise
 
@@ -88,8 +86,8 @@ def main():
                            "Prints a warning if fewer than 50 validated examples are available.")
     parser.add_argument("--n-cves", type=int, default=300)
     parser.add_argument("--n-ips",  type=int, default=300)
-    parser.add_argument("--no-greynoise", action="store_true",
-                        help="Skip GreyNoise enrichment (faster --live runs, no rate-limit waits)")
+    parser.add_argument("--greynoise", action="store_true",
+                        help="Enable GreyNoise IP enrichment (~45s extra, opt-in)")
     args = parser.parse_args()
 
     pipeline_start = time.time()
@@ -121,7 +119,7 @@ def main():
         raw_greynoise = []   # no synthetic GreyNoise data (per Phase 7 spec)
     else:
         raw_nvd, raw_abuseipdb, raw_greynoise = collect_live(
-            skip_greynoise=args.no_greynoise
+            skip_greynoise=not args.greynoise
         )
 
     if not skip_collection:
