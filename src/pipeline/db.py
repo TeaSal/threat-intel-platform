@@ -469,6 +469,14 @@ def fetch_all_as_dicts() -> List[dict]:
         return [dict(r) for r in rows]
 
 
+def get_existing_ids() -> set:
+    """Return the set of all threat IDs currently in the database. Used for incremental ingestion."""
+    init_db()
+    with get_connection() as conn:
+        rows = conn.execute("SELECT id FROM threats").fetchall()
+        return {r["id"] for r in rows}
+
+
 def count() -> int:
     init_db()
     with get_connection() as conn:
